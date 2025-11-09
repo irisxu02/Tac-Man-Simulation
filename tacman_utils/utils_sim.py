@@ -3,8 +3,7 @@ from collections import defaultdict
 import carb
 import torch
 
-from omni.isaac.urdf import _urdf # Isaac Sim 2022
-# from omni.importer.urdf import _urdf # Isaac Sim 2023, where some bugs exist
+from isaacsim.asset.importer.urdf import _urdf
 from PIL import Image
 
 def get_default_import_config():

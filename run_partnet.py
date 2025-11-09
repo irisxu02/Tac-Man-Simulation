@@ -60,9 +60,9 @@ from tqdm import tqdm, trange
 import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from utils.utils_sim import init_capture, write_rgb_data, get_default_import_config
-from utils.utils_3d import find_rigid_alignment, quat_diff, quat_diff_batch
-from utils.sim_consts import *
+from tacman_utils.utils_sim import init_capture, write_rgb_data, get_default_import_config
+from tacman_utils.utils_3d import find_rigid_alignment, quat_diff, quat_diff_batch
+from tacman_utils.sim_consts import *
 
 from omni.physx import acquire_physx_interface
 
