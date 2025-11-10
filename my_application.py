@@ -44,9 +44,10 @@ from isaacsim.robot_motion.motion_generation import RmpFlow, ArticulationMotionP
 from isaacsim.robot_motion.motion_generation.interface_config_loader import (
     load_supported_motion_policy_config,
 )
-from pxr import Gf, UsdPhysics, UsdShade
-from omni.physx.scripts import utils
+from pxr import UsdLux, Sdf, Gf, UsdPhysics, UsdShade
+from omni.physx.scripts import utils, physicsUtils
 import xml.etree.ElementTree as ET
+from common import set_drive_parameters
 
 from tacman_utils.utils_sim import get_default_import_config, init_capture
 
@@ -107,7 +108,8 @@ class Manipulation(BaseTask):
         self.hand_name = "panda"
         self.obj_id = str(obj_id)
 
-        self.friction_mat = friction_mat
+        # TODO: remove, since not used elsewhere
+        # self.friction_mat = friction_mat
 
         self.scene_prim = f"/World/Env_{self.i_env}"
         self.object_prim_path = f"{self.scene_prim}/Obj_{self.obj_id}"
@@ -151,7 +153,6 @@ class Manipulation(BaseTask):
         self.all_links = self.obj_config["all_links"]
 
         import_config = get_default_import_config()
-
         urdf_path = os.path.join(self.object_dir, "mobility_relabel_gapartnet.urdf")
 
         print(f"Loading URDF from: {urdf_path}")
@@ -181,9 +182,11 @@ class Manipulation(BaseTask):
         self.r_finger_kpt = torch.tensor(CONTACT_AREAS[self.hand_name]["R"], dtype=torch.float32, device='cuda')
         self.finger_xx, self.finger_yy = torch.linspace(0, 1, 10, device='cuda'), torch.linspace(0, 1, 10,
                                                                                                  device='cuda')
-        self.l_finger_grid, self.r_finger_grid = torch.stack(torch.meshgrid([self.finger_xx, self.finger_yy]),
-                                                             dim=-1).reshape(-1, 2).clone(), torch.stack(
-            torch.meshgrid([self.finger_xx, self.finger_yy]), dim=-1).reshape(-1, 2).clone()
+        self.l_finger_grid, self.r_finger_grid = torch.stack(
+            torch.meshgrid(self.finger_xx, self.finger_yy, indexing='ij'), dim=-1
+        ).reshape(-1, 2).clone(), torch.stack(
+            torch.meshgrid(self.finger_xx, self.finger_yy, indexing='ij'), dim=-1
+        ).reshape(-1, 2).clone()
         self.l_finger_pt = self.l_finger_kpt[0].unsqueeze(0) + self.l_finger_grid[:, 0].unsqueeze(-1) * (
                     self.l_finger_kpt[1] - self.l_finger_kpt[0]).unsqueeze(0) + self.l_finger_grid[:, 1].unsqueeze(
             -1) * (self.l_finger_kpt[3] - self.l_finger_kpt[0]).unsqueeze(0)
@@ -192,6 +195,9 @@ class Manipulation(BaseTask):
             -1) * (self.r_finger_kpt[3] - self.r_finger_kpt[0]).unsqueeze(0)
 
         stage = omni.usd.get_context().get_stage()
+        
+        dome = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
+        dome.CreateIntensityAttr().Set(500.0)
 
         self.hand_prim = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_hand")
         self.object_prim = stage.GetPrimAtPath(self.object_prim_path)
@@ -199,7 +205,6 @@ class Manipulation(BaseTask):
         self.l_finger_prim = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_leftfinger")
         self.finger_joint_prim_1 = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_hand/panda_finger_joint1")
         self.finger_joint_prim_2 = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_hand/panda_finger_joint2")
-        self.target_joint_prim = stage.GetPrimAtPath(self.target_joint_path)
         self.handle_prim = stage.GetPrimAtPath(f"{self.object_prim_path}/{self.target_link}")
         self.base_link_prim = stage.GetPrimAtPath(f"{self.object_prim_path}/base_link")
         self.target_joint_type = self.obj_config['joint_type']
@@ -218,18 +223,28 @@ class Manipulation(BaseTask):
         # Goal config
         self.succ_dof_pos = 0.25 if self.target_joint_type == "slider" else np.pi / 3
 
+        # Configure finger drives using the helper from `common.py` which
+        # safely creates/get attributes for drives. Use a position drive with
+        # a large max_force so fingers can close reliably.
         finger_drive_1 = UsdPhysics.DriveAPI.Get(self.finger_joint_prim_1, "linear")
         finger_drive_2 = UsdPhysics.DriveAPI.Get(self.finger_joint_prim_2, "linear")
-        finger_drive_1.GetMaxForceAttr().Set(1e4)
-        finger_drive_2.GetMaxForceAttr().Set(1e4)
-
+        # Use set_drive_parameters to create attrs if missing and set sensible
+        # defaults: target=0 (closed), stiffness and damping large enough, and
+        # max_force same as original implementation (1e4).
+        set_drive_parameters(finger_drive_1, "position", 0, stiffness=1e6, damping=1e5, max_force=1e4)
+        set_drive_parameters(finger_drive_2, "position", 0, stiffness=1e6, damping=1e5, max_force=1e4)
+        
         for link in self.all_links:
+            prim_path = f"{self.object_prim_path}/{link}"
+            prim = stage.GetPrimAtPath(prim_path)
             if link == self.target_link or link == self.base_link or link == self.handle_base_link:
-                UsdPhysics.MassAPI.Apply(stage.GetPrimAtPath(f"{self.object_prim_path}/{link}")).CreateMassAttr().Set(0.25)
+                UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.25)
                 continue
-            print(f"Removing collider and rigid body for {link}")
-            utils.removeCollider(stage.GetPrimAtPath(f"{self.object_prim_path}/{link}"))
-            utils.removeRigidBody(stage.GetPrimAtPath(f"{self.object_prim_path}/{link}"))
+
+            # TODO: Check if we should remove rigid body or not
+            print(f"Removing collider for {link} (keeping rigid body)")
+            utils.removeCollider(prim)
+            #utils.removeRigidBody(prim)
 
         if self.obj_id in ["20043", "32932", "34610", "45243", "45677"]:
             utils.setRigidBody(self.handle_prim, "convexHull", False)
@@ -253,17 +268,55 @@ class Manipulation(BaseTask):
     def post_reset(self):
         pass
 
+    # TODO: See if needed
     def _setup_physics_material(self, path, physics_material_path):
-        pass
+        stage = omni.usd.get_context().get_stage()
+        collisionAPI = UsdPhysics.CollisionAPI.Get(stage, path)
+        prim = stage.GetPrimAtPath(path)
+        if not collisionAPI:
+            collisionAPI = UsdPhysics.CollisionAPI.Apply(prim)
+        # apply material
+        physicsUtils.add_physics_material_to_prim(stage, prim, physics_material_path)
 
-    def setup_ik_solver(self, franka):  # TODO: is this still necessary
-        pass
+    def setup_ik_solver(self, franka):
+        from isaacsim.robot_motion.motion_generation.interface_config_loader import load_supported_lula_kinematics_solver_config
+        from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver, ArticulationKinematicsSolver
+
+        kinematics_config = load_supported_lula_kinematics_solver_config("Franka")
+        self._kine_solver = LulaKinematicsSolver(**kinematics_config)
+        self._art_kine_solver = ArticulationKinematicsSolver(self._franka, self._kine_solver, "panda_hand")
 
     def set_grasp_pose(self):
-        pass
+        # p: world position, r: quaternion order [x,y,z,w] or appropriate conversion
+        p, r = all_grasps[self.obj_id]['p'], all_grasps[self.obj_id]['R']
+        p = np.asarray(p) * args.obj_scale
+        p[0] += args.x_offset + self.x_offset
+        p[1] += args.y_offset + self.y_offset
+        p[2] += self.obj_config['height'] * args.obj_scale + self.z_offset
+        r = R.from_euler("ZYX", r, False).as_quat()  # may need reordering to [x,y,z,w]
+
+        self.grasp_p = p
+
+        print(f"Setting grasp pose to {p}, {r}")
+
+        robot_base_translation, robot_base_orientation = self._franka.get_world_pose()
+        self._kine_solver.set_robot_base_pose(robot_base_translation, robot_base_orientation)
+
+        action, ik_success = self._art_kine_solver.compute_inverse_kinematics(p + self._offset, r)
+        if ik_success:
+            action.joint_positions[-1] = 0.04
+            action.joint_positions[-2] = 0.04
+            self._franka.set_joint_positions(action.joint_positions)
+            self._franka.set_joint_velocities([0.0] * self._franka.get_num_dofs())
+            
+            # moved the gripper into success branch
+            from isaacsim.core.utils.types import ArticulationAction
+            self._franka.gripper.apply_action(ArticulationAction([0.00, 0.00]))
+        
+        return ik_success
 
     def do_ik(self, p, r):
-        pass
+        return self._art_kine_solver.compute_inverse_kinematics(p + self._offset, r)
 
 
 world = World()
@@ -335,7 +388,7 @@ for i_task, obj_id in enumerate(TASK_IDS):
             i_task,
             obj_id,
             _physicsMaterialPath,
-            task_data_dir,
+            report_dir=task_data_dir,
             offset=np.array([i_task // n_each_row, i_task % n_each_row, 0.0]) * spacing,
         )
     )
@@ -373,6 +426,9 @@ for i_task, obj_id in enumerate(TASK_IDS):
         _tasks[i_task].setup_ik_solver(f)
     f.disable_gravity()
 
+target_joint_drive = [UsdPhysics.DriveAPI.Apply(target_joints[j].GetPrim(),
+                                                "linear" if _tasks[j].target_joint_type == "slider" else "angular") for
+                      j in range(len(target_joints))]
 
 # Keep simulation running until manually closed
 print("Simulation loaded. Press Ctrl+C or close the window to exit.")
