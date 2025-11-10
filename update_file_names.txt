@@ -1,0 +1,25 @@
+Need to update from '-' to '_':
+So far only did this for the default object.
+
+
+# go to object dir
+cd /home/ubuntu/Tac-Man-Simulation/data/gapartnet/46466
+
+# backup
+cp -r textured_objs textured_objs_backup
+cp mobility_relabel_gapartnet.urdf mobility_relabel_gapartnet.urdf.bak
+
+# rename mesh and mtl files (preview with echo first)
+for f in textured_objs/original-*.obj textured_objs/original-*.mtl; do
+  echo mv "$f" "${f/original-/original_}"
+done
+
+# If preview looks good, actually rename:
+for f in textured_objs/original-*.obj textured_objs/original-*.mtl; do
+  mv "$f" "${f/original-/original_}"
+done
+
+# update filenames inside URDF and any .mtl files
+sed -i 's/original-/original_/g' mobility_relabel_gapartnet.urdf
+# update material files too (if they contain hyphen refs)
+find textured_objs -type f -name '*.mtl' -exec sed -i 's/original-/original_/g' {} \;
