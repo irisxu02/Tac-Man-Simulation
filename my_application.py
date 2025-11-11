@@ -11,11 +11,9 @@ parser.add_argument("--y_offset", default="0.0", type=float)
 parser.add_argument("--z_offset", default="0.0", type=float)
 args = parser.parse_args()
 
-# launch Isaac Sim before any other imports
-# default first two lines in any standalone application
 from isaacsim import SimulationApp
 
-simulation_app = SimulationApp({"headless": False})  # we can also run as headless.
+simulation_app = SimulationApp({"headless": args.headless})
 
 
 import json
@@ -31,22 +29,29 @@ import omni.kit.commands
 import omni.usd
 import torch
 import trimesh as tm
+from omni.isaac.dynamic_control import _dynamic_control
 from isaacsim.asset.importer.urdf import _urdf
 from isaacsim.core.api import World
 from isaacsim.core.api.objects import DynamicCuboid
 from isaacsim.core.api.tasks import BaseTask
 from isaacsim.core.prims import SingleXFormPrim as XFormPrim
 from isaacsim.core.prims import SingleArticulation as Articulation
-from isaacsim.core.utils.extensions import get_extension_path_from_name
 from isaacsim.core.utils.stage import add_reference_to_stage
+from isaacsim.core.utils.types import ArticulationAction
 from isaacsim.storage.native import get_assets_root_path
-from isaacsim.robot_motion.motion_generation import RmpFlow, ArticulationMotionPolicy
+from isaacsim.robot_motion.motion_generation import (
+    RmpFlow,
+    ArticulationMotionPolicy,
+    LulaKinematicsSolver,
+    ArticulationKinematicsSolver,
+)
 from isaacsim.robot_motion.motion_generation.interface_config_loader import (
     load_supported_motion_policy_config,
+    load_supported_lula_kinematics_solver_config,
 )
 from pxr import UsdLux, Sdf, Gf, UsdPhysics, UsdShade
 from omni.physx.scripts import utils, physicsUtils
-import xml.etree.ElementTree as ET
+from scipy.spatial.transform import Rotation as R
 from common import set_drive_parameters
 
 from tacman_utils.utils_sim import get_default_import_config, init_capture
@@ -108,8 +113,8 @@ class Manipulation(BaseTask):
         self.hand_name = "panda"
         self.obj_id = str(obj_id)
 
-        # TODO: remove, since not used elsewhere
-        # self.friction_mat = friction_mat
+        # Store physics material path for applying to contact surfaces
+        self.friction_mat = friction_mat
 
         self.scene_prim = f"/World/Env_{self.i_env}"
         self.object_prim_path = f"{self.scene_prim}/Obj_{self.obj_id}"
@@ -139,10 +144,40 @@ class Manipulation(BaseTask):
         super().set_up_scene(scene)
 
         # Load robot and its IK solver using add_reference_to_stage
-        path_to_robot_usd = get_assets_root_path() + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
+        path_to_robot_usd = (
+            get_assets_root_path()
+            + "/Isaac/Robots/FrankaRobotics/FrankaPanda/franka.usd"
+        )
         add_reference_to_stage(path_to_robot_usd, self.franka_prim_path)
-        self._franka = Articulation(self.franka_prim_path, name=f"manipulator_{self.i_env}")
+        self._franka = Articulation(
+            self.franka_prim_path, name=f"manipulator_{self.i_env}"
+        )
         scene.add(self._franka)
+
+        # The gripper consists of joints 7 and 8 (panda_finger_joint1 and panda_finger_joint2)
+        class GripperController:
+            """Simple gripper controller wrapper for parallel jaw gripper."""
+
+            def __init__(self, articulation):
+                self._articulation = articulation
+                self._gripper_joint_indices = [7, 8]  # Last 2 DOFs are gripper fingers
+
+            def apply_action(self, action):
+                # action: ArticulationAction with 2 joint positions for gripper fingers
+                if hasattr(action, "joint_positions"):
+                    positions = action.joint_positions
+                else:
+                    positions = action
+
+                current_positions = self._articulation.get_joint_positions()
+                new_positions = np.array(current_positions)
+                new_positions[self._gripper_joint_indices] = positions
+
+                self._articulation.get_articulation_controller().apply_action(
+                    ArticulationAction(joint_positions=new_positions)
+                )
+
+        self._franka.gripper = GripperController(self._franka)
 
         # Load object
         self.target_link = "handle"
@@ -167,57 +202,105 @@ class Manipulation(BaseTask):
             omni.kit.commands.execute(
                 "MovePrim", path_from=prim_path, path_to=self.object_prim_path
             )
+            # Allow stage to update after move to avoid fabric warnings
+            omni.kit.app.get_app().update()
         else:
-            carb.log_error("Could not resolve imported URDF prim; object will not be placed.")
+            carb.log_error(
+                "Could not resolve imported URDF prim; object will not be placed."
+            )
 
         self.target_joint = self.obj_config["target_joint"]
         self.target_joint_path = f"{self.object_prim_path}/{self.target_joint}"
         self.target_joint_name = self.target_joint_path.split("/")[-1]
 
         # Load point clouds for computation
-        self.handle_mesh = tm.load(os.path.join(PWD, self.obj_config['grasp_part_mesh']), force='mesh')
-        self.handle_pt = torch.tensor(self.handle_mesh.sample(4096), dtype=torch.float32, device='cuda')
+        self.handle_mesh = tm.load(
+            os.path.join(PWD, self.obj_config["grasp_part_mesh"]), force="mesh"
+        )
+        self.handle_pt = torch.tensor(
+            self.handle_mesh.sample(4096), dtype=torch.float32, device="cuda"
+        )
 
-        self.l_finger_kpt = torch.tensor(CONTACT_AREAS[self.hand_name]["L"], dtype=torch.float32, device='cuda')
-        self.r_finger_kpt = torch.tensor(CONTACT_AREAS[self.hand_name]["R"], dtype=torch.float32, device='cuda')
-        self.finger_xx, self.finger_yy = torch.linspace(0, 1, 10, device='cuda'), torch.linspace(0, 1, 10,
-                                                                                                 device='cuda')
-        self.l_finger_grid, self.r_finger_grid = torch.stack(
-            torch.meshgrid(self.finger_xx, self.finger_yy, indexing='ij'), dim=-1
-        ).reshape(-1, 2).clone(), torch.stack(
-            torch.meshgrid(self.finger_xx, self.finger_yy, indexing='ij'), dim=-1
-        ).reshape(-1, 2).clone()
-        self.l_finger_pt = self.l_finger_kpt[0].unsqueeze(0) + self.l_finger_grid[:, 0].unsqueeze(-1) * (
-                    self.l_finger_kpt[1] - self.l_finger_kpt[0]).unsqueeze(0) + self.l_finger_grid[:, 1].unsqueeze(
-            -1) * (self.l_finger_kpt[3] - self.l_finger_kpt[0]).unsqueeze(0)
-        self.r_finger_pt = self.r_finger_kpt[0].unsqueeze(0) + self.r_finger_grid[:, 0].unsqueeze(-1) * (
-                    self.r_finger_kpt[1] - self.r_finger_kpt[0]).unsqueeze(0) + self.r_finger_grid[:, 1].unsqueeze(
-            -1) * (self.r_finger_kpt[3] - self.r_finger_kpt[0]).unsqueeze(0)
+        self.l_finger_kpt = torch.tensor(
+            CONTACT_AREAS[self.hand_name]["L"], dtype=torch.float32, device="cuda"
+        )
+        self.r_finger_kpt = torch.tensor(
+            CONTACT_AREAS[self.hand_name]["R"], dtype=torch.float32, device="cuda"
+        )
+        self.finger_xx, self.finger_yy = torch.linspace(
+            0, 1, 10, device="cuda"
+        ), torch.linspace(0, 1, 10, device="cuda")
+        self.l_finger_grid, self.r_finger_grid = (
+            torch.stack(
+                torch.meshgrid(self.finger_xx, self.finger_yy, indexing="ij"), dim=-1
+            )
+            .reshape(-1, 2)
+            .clone(),
+            torch.stack(
+                torch.meshgrid(self.finger_xx, self.finger_yy, indexing="ij"), dim=-1
+            )
+            .reshape(-1, 2)
+            .clone(),
+        )
+        self.l_finger_pt = (
+            self.l_finger_kpt[0].unsqueeze(0)
+            + self.l_finger_grid[:, 0].unsqueeze(-1)
+            * (self.l_finger_kpt[1] - self.l_finger_kpt[0]).unsqueeze(0)
+            + self.l_finger_grid[:, 1].unsqueeze(-1)
+            * (self.l_finger_kpt[3] - self.l_finger_kpt[0]).unsqueeze(0)
+        )
+        self.r_finger_pt = (
+            self.r_finger_kpt[0].unsqueeze(0)
+            + self.r_finger_grid[:, 0].unsqueeze(-1)
+            * (self.r_finger_kpt[1] - self.r_finger_kpt[0]).unsqueeze(0)
+            + self.r_finger_grid[:, 1].unsqueeze(-1)
+            * (self.r_finger_kpt[3] - self.r_finger_kpt[0]).unsqueeze(0)
+        )
 
         stage = omni.usd.get_context().get_stage()
-        
+
         dome = UsdLux.DomeLight.Define(stage, Sdf.Path("/World/DomeLight"))
         dome.CreateIntensityAttr().Set(500.0)
 
         self.hand_prim = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_hand")
         self.object_prim = stage.GetPrimAtPath(self.object_prim_path)
-        self.r_finger_prim = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_rightfinger")
-        self.l_finger_prim = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_leftfinger")
-        self.finger_joint_prim_1 = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_hand/panda_finger_joint1")
-        self.finger_joint_prim_2 = stage.GetPrimAtPath(f"{self.franka_prim_path}/panda_hand/panda_finger_joint2")
-        self.handle_prim = stage.GetPrimAtPath(f"{self.object_prim_path}/{self.target_link}")
+        self.r_finger_prim = stage.GetPrimAtPath(
+            f"{self.franka_prim_path}/panda_rightfinger"
+        )
+        self.l_finger_prim = stage.GetPrimAtPath(
+            f"{self.franka_prim_path}/panda_leftfinger"
+        )
+        self.finger_joint_prim_1 = stage.GetPrimAtPath(
+            f"{self.franka_prim_path}/panda_hand/panda_finger_joint1"
+        )
+        self.finger_joint_prim_2 = stage.GetPrimAtPath(
+            f"{self.franka_prim_path}/panda_hand/panda_finger_joint2"
+        )
+        self.target_joint_prim = stage.GetPrimAtPath(self.target_joint_path)
+        self.handle_prim = stage.GetPrimAtPath(
+            f"{self.object_prim_path}/{self.target_link}"
+        )
         self.base_link_prim = stage.GetPrimAtPath(f"{self.object_prim_path}/base_link")
-        self.target_joint_type = self.obj_config['joint_type']
+        self.target_joint_type = self.obj_config["joint_type"]
 
-        self.object_prim.GetAttribute("xformOp:translate").Set(tuple(
-            Gf.Vec3f(args.x_offset + self.x_offset, args.y_offset + self.y_offset,
-                     self.obj_config['height'] * args.obj_scale + self.z_offset)))
+        self.object_prim.GetAttribute("xformOp:translate").Set(
+            tuple(
+                Gf.Vec3f(
+                    args.x_offset + self.x_offset,
+                    args.y_offset + self.y_offset,
+                    self.obj_config["height"] * args.obj_scale + self.z_offset,
+                )
+            )
+        )
         self.object_prim.GetAttribute("xformOp:scale").Set(
-            tuple(Gf.Vec3f(args.obj_scale, args.obj_scale, args.obj_scale)))
+            tuple(Gf.Vec3f(args.obj_scale, args.obj_scale, args.obj_scale))
+        )
 
         ## Set object position
         self._task_objects["Manipulator"] = self._franka
-        self._task_objects["Object"] = XFormPrim(prim_path=self.object_prim_path, name=f"object-{self.i_env}")
+        self._task_objects["Object"] = XFormPrim(
+            prim_path=self.object_prim_path, name=f"object-{self.i_env}"
+        )
         self._move_task_objects_to_their_frame()
 
         # Goal config
@@ -231,20 +314,28 @@ class Manipulation(BaseTask):
         # Use set_drive_parameters to create attrs if missing and set sensible
         # defaults: target=0 (closed), stiffness and damping large enough, and
         # max_force same as original implementation (1e4).
-        set_drive_parameters(finger_drive_1, "position", 0, stiffness=1e6, damping=1e5, max_force=1e4)
-        set_drive_parameters(finger_drive_2, "position", 0, stiffness=1e6, damping=1e5, max_force=1e4)
-        
+        set_drive_parameters(
+            finger_drive_1, "position", 0, stiffness=1e6, damping=1e5, max_force=1e4
+        )
+        set_drive_parameters(
+            finger_drive_2, "position", 0, stiffness=1e6, damping=1e5, max_force=1e4
+        )
+
         for link in self.all_links:
             prim_path = f"{self.object_prim_path}/{link}"
             prim = stage.GetPrimAtPath(prim_path)
-            if link == self.target_link or link == self.base_link or link == self.handle_base_link:
+            if (
+                link == self.target_link
+                or link == self.base_link
+                or link == self.handle_base_link
+            ):
                 UsdPhysics.MassAPI.Apply(prim).CreateMassAttr().Set(0.25)
                 continue
 
             # TODO: Check if we should remove rigid body or not
             print(f"Removing collider for {link} (keeping rigid body)")
             utils.removeCollider(prim)
-            #utils.removeRigidBody(prim)
+            # utils.removeRigidBody(prim)
 
         if self.obj_id in ["20043", "32932", "34610", "45243", "45677"]:
             utils.setRigidBody(self.handle_prim, "convexHull", False)
@@ -254,45 +345,99 @@ class Manipulation(BaseTask):
         else:
             utils.setRigidBody(self.handle_prim, "boundingCube", False)
 
+        # Apply physics material to contact surfaces for realistic friction
+        # Use convexHull for gripper fingers (simpler geometry, better performance)
+        # Use same approximation as handle for the target link
+        target_approximation = (
+            "convexDecomposition"
+            if self.obj_id in ["46462", "45756"]
+            else (
+                "convexHull"
+                if self.obj_id in ["20043", "32932", "34610", "45243", "45677"]
+                else "boundingCube"
+            )
+        )
+
+        # self._setup_physics_material(f"{self.franka_prim_path}/panda_leftfinger", self.friction_mat, "convexHull")
+        # self._setup_physics_material(f"{self.franka_prim_path}/panda_rightfinger", self.friction_mat, "convexHull")
+        # self._setup_physics_material(f"{self.object_prim_path}/{self.target_link}", self.friction_mat, target_approximation)
+
         print(f"Loaded {self.obj_id}")
 
     def get_observations(self):
+        # TODO
         pass
 
     def pre_step(self, control_index, simulation_time):
-        pass
+        """Monitor joint position and check if task is achieved."""
+        # Skip if we couldn't find the target joint
+        if not hasattr(self, "dof_ptr") or self.dof_ptr is None:
+            return
 
-    def report():
-        pass
+        self.dc = _dynamic_control.acquire_dynamic_control_interface()
+        self.cur_dof_pos = self.dc.get_dof_position(self.dof_ptr)
+        self._task_achieved = self.cur_dof_pos > self.succ_dof_pos
 
     def post_reset(self):
-        pass
+        """Initialize dynamic control interface and reset task state after world.reset()."""
+        self.dc = _dynamic_control.acquire_dynamic_control_interface()
+        # Extract the joint name (e.g., "joint_0" from "link_4/joint_0")
+        self.target_joint_name = self.target_joint.split("/")[-1]
+        # Look in /joints/ folder
+        joints_folder_path = f"{self.object_prim_path}/joints/{self.target_joint_name}"
+        self.target_joint_path = joints_folder_path
+        self.art = self.dc.get_articulation(self.target_joint_path)
+        self.dc.wake_up_articulation(self.art)
+        self.dof_ptr = self.dc.find_articulation_dof(self.art, self.target_joint_name)
 
-    # TODO: See if needed
-    def _setup_physics_material(self, path, physics_material_path):
+        self._task_achieved = False
+        self.attempt_counter = 0
+
+    def _setup_physics_material(
+        self, prim_path, physics_material_path, approximation="convexHull"
+    ):
+        """Apply physics material (friction, restitution) to a prim's collision geometry.
+
+        Args:
+            prim_path: Absolute path to the prim (e.g., gripper finger or object link)
+            physics_material_path: Path to the physics material definition
+            approximation: Collision approximation type for dynamic bodies (default: "convexHull")
+                          Options: "convexHull", "convexDecomposition", "boundingCube", "boundingSphere"
+        """
         stage = omni.usd.get_context().get_stage()
-        collisionAPI = UsdPhysics.CollisionAPI.Get(stage, path)
-        prim = stage.GetPrimAtPath(path)
+        prim = stage.GetPrimAtPath(prim_path)
+
+        if not prim.IsValid():
+            carb.log_warn(
+                f"Cannot apply physics material: prim at {prim_path} is invalid"
+            )
+            return
+
+        # Set collision approximation to avoid triangle mesh errors for dynamic bodies
+        # This must be done before applying collision API
+        utils.setRigidBody(prim, approximation, False)
+
+        # Ensure the prim has collision API
+        collisionAPI = UsdPhysics.CollisionAPI.Get(stage, prim_path)
         if not collisionAPI:
             collisionAPI = UsdPhysics.CollisionAPI.Apply(prim)
-        # apply material
+
         physicsUtils.add_physics_material_to_prim(stage, prim, physics_material_path)
 
     def setup_ik_solver(self, franka):
-        from isaacsim.robot_motion.motion_generation.interface_config_loader import load_supported_lula_kinematics_solver_config
-        from isaacsim.robot_motion.motion_generation import LulaKinematicsSolver, ArticulationKinematicsSolver
-
         kinematics_config = load_supported_lula_kinematics_solver_config("Franka")
         self._kine_solver = LulaKinematicsSolver(**kinematics_config)
-        self._art_kine_solver = ArticulationKinematicsSolver(self._franka, self._kine_solver, "panda_hand")
+        self._art_kine_solver = ArticulationKinematicsSolver(
+            self._franka, self._kine_solver, "panda_hand"
+        )
 
     def set_grasp_pose(self):
         # p: world position, r: quaternion order [x,y,z,w] or appropriate conversion
-        p, r = all_grasps[self.obj_id]['p'], all_grasps[self.obj_id]['R']
+        p, r = all_grasps[self.obj_id]["p"], all_grasps[self.obj_id]["R"]
         p = np.asarray(p) * args.obj_scale
         p[0] += args.x_offset + self.x_offset
         p[1] += args.y_offset + self.y_offset
-        p[2] += self.obj_config['height'] * args.obj_scale + self.z_offset
+        p[2] += self.obj_config["height"] * args.obj_scale + self.z_offset
         r = R.from_euler("ZYX", r, False).as_quat()  # may need reordering to [x,y,z,w]
 
         self.grasp_p = p
@@ -300,19 +445,31 @@ class Manipulation(BaseTask):
         print(f"Setting grasp pose to {p}, {r}")
 
         robot_base_translation, robot_base_orientation = self._franka.get_world_pose()
-        self._kine_solver.set_robot_base_pose(robot_base_translation, robot_base_orientation)
+        self._kine_solver.set_robot_base_pose(
+            robot_base_translation, robot_base_orientation
+        )
 
-        action, ik_success = self._art_kine_solver.compute_inverse_kinematics(p + self._offset, r)
+        action, ik_success = self._art_kine_solver.compute_inverse_kinematics(
+            p + self._offset, r
+        )
         if ik_success:
-            action.joint_positions[-1] = 0.04
-            action.joint_positions[-2] = 0.04
-            self._franka.set_joint_positions(action.joint_positions)
-            self._franka.set_joint_velocities([0.0] * self._franka.get_num_dofs())
-            
-            # moved the gripper into success branch
-            from isaacsim.core.utils.types import ArticulationAction
+            current_positions = self._franka.get_joint_positions()
+
+            # Create new joint positions array
+            joint_positions = np.array(current_positions)
+
+            # Set arm joint positions from IK solution (first 7 joints)
+            joint_positions[:7] = action.joint_positions[:7]
+
+            # Set gripper fingers to open position (last 2 joints)
+            joint_positions[7] = 0.04  # panda_finger_joint1
+            joint_positions[8] = 0.04  # panda_finger_joint2
+
+            self._franka.set_joint_positions(joint_positions)
+            self._franka.set_joint_velocities([0.0] * 9)
+
             self._franka.gripper.apply_action(ArticulationAction([0.00, 0.00]))
-        
+
         return ik_success
 
     def do_ik(self, p, r):
@@ -322,7 +479,6 @@ class Manipulation(BaseTask):
 world = World()
 world.scene.add_default_ground_plane()
 stage = omni.usd.get_context().get_stage()
-world._physics_context.set_gravity(value=0.0)
 
 stage.GetPrimAtPath("/World/defaultGroundPlane/Environment").GetAttribute(
     "xformOp:translate"
@@ -346,7 +502,7 @@ env_states = torch.zeros([n_tasks], dtype=torch.int32, device="cuda")
 
 assets_root_path = get_assets_root_path()
 if assets_root_path is None:
-    carb.log_error("Could not find nucleus server with /Isaac folder")
+    carb.log_error("get_assets_root_path() returned None")
 
 # draw = _debug_draw.acquire_debug_draw_interface()
 
@@ -355,11 +511,6 @@ spacing = 2.0
 
 time_tag = datetime.now().strftime("%Y%m%d-%H%M%S")
 data_dir = os.path.join(PWD, "data", "manipulation", time_tag)
-
-
-light_prim = stage.GetPrimAtPath("/World/defaultGroundPlane/SphereLight")
-light_prim.GetAttribute("xformOp:translate").Set(Gf.Vec3f(0, -3.0, 6.0))
-light_prim.GetAttribute("xformOp:scale").Set(Gf.Vec3f(0.015, 0.015, 0.015))
 
 _material_static_friction = 1.0
 _material_dynamic_friction = 1.0
@@ -382,7 +533,7 @@ for i_task, obj_id in enumerate(TASK_IDS):
     env_prim_path = f"/World/Env_{i_task}"
     if not stage.GetPrimAtPath(env_prim_path):
         stage.DefinePrim(env_prim_path, "Xform")
-    
+
     world.add_task(
         Manipulation(
             i_task,
@@ -404,34 +555,53 @@ for i_task, obj_id in enumerate(TASK_IDS):
 
     _frankas.append(_tasks[i_task]._franka)
     _art_controllers.append(_frankas[i_task].get_articulation_controller())
-    
+
     # Only append target joint if it exists
-    if hasattr(_tasks[i_task], 'target_joint_prim') and _tasks[i_task].target_joint_prim:
+    if (
+        hasattr(_tasks[i_task], "target_joint_prim")
+        and _tasks[i_task].target_joint_prim
+    ):
         target_joints.append(_tasks[i_task].target_joint_prim)
     else:
         carb.log_warn(f"Task {i_task} has no target joint prim")
 
     # Load RMPflow configuration for supported Franka robot
     rmp_config = load_supported_motion_policy_config("Franka", "RMPflow")
-    
+
     # Initialize RmpFlow object
     _rmpflows.append(RmpFlow(**rmp_config))
-    
+
     # Use ArticulationMotionPolicy wrapper to connect rmpflow to the Franka robot articulation
     _art_rmpflows.append(ArticulationMotionPolicy(_frankas[i_task], _rmpflows[i_task]))
 
     # Setup IK solver and disable gravity
     f = world.scene.get_object(f"manipulator_{i_task}")
-    if hasattr(_tasks[i_task], 'setup_ik_solver'):
+    if hasattr(_tasks[i_task], "setup_ik_solver"):
         _tasks[i_task].setup_ik_solver(f)
     f.disable_gravity()
 
-target_joint_drive = [UsdPhysics.DriveAPI.Apply(target_joints[j].GetPrim(),
-                                                "linear" if _tasks[j].target_joint_type == "slider" else "angular") for
-                      j in range(len(target_joints))]
+target_joint_drive = [
+    UsdPhysics.DriveAPI.Apply(
+        target_joints[j].GetPrim(),
+        "linear" if _tasks[j].target_joint_type == "slider" else "angular",
+    )
+    for j in range(len(target_joints))
+]
 
-# Keep simulation running until manually closed
-print("Simulation loaded. Press Ctrl+C or close the window to exit.")
+for i_task, t in enumerate(_tasks):
+    _art_controllers[i_task].apply_action(ArticulationAction([0.0] * 9))
+    ik_success = t.set_grasp_pose()
+    if not ik_success:
+        carb.log_error(f"IK failed for task {i_task}. Cannot set grasp pose.")
+        simulation_app.close()
+        exit()
+    print(f"Task {i_task}: Grasp pose set successfully")
+
+
+# TODO: Add main simulation loop logic here
+
+
+print("Simulation loaded.")
 while simulation_app.is_running():
     world.step(render=True)
 
