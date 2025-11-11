@@ -210,8 +210,8 @@ class Manipulation(BaseTask):
             )
 
         self.target_joint = self.obj_config["target_joint"]
-        self.target_joint_path = f"{self.object_prim_path}/{self.target_joint}"
-        self.target_joint_name = self.target_joint_path.split("/")[-1]
+        self.target_joint_name = self.target_joint.split("/")[-1]
+        self.target_joint_path = f"{self.object_prim_path}/joints/{self.target_joint_name}"
 
         # Load point clouds for computation
         self.handle_mesh = tm.load(
@@ -384,8 +384,7 @@ class Manipulation(BaseTask):
         # Extract the joint name (e.g., "joint_0" from "link_4/joint_0")
         self.target_joint_name = self.target_joint.split("/")[-1]
         # Look in /joints/ folder
-        joints_folder_path = f"{self.object_prim_path}/joints/{self.target_joint_name}"
-        self.target_joint_path = joints_folder_path
+        self.target_joint_path = f"{self.object_prim_path}/joints/{self.target_joint_name}"
         self.art = self.dc.get_articulation(self.target_joint_path)
         self.dc.wake_up_articulation(self.art)
         self.dof_ptr = self.dc.find_articulation_dof(self.art, self.target_joint_name)
