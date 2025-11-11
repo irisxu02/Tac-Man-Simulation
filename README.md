@@ -1,3 +1,6 @@
+For IsaacSim 5.0, the entry point is my_application.py
+
+---
 # Tac-Man: Simulation Studies
 
 ![Teaser](assets/teaser.jpg)
