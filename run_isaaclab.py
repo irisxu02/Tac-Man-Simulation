@@ -31,13 +31,15 @@ from isaaclab.controllers import DifferentialIKController, DifferentialIKControl
 from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers
-from isaaclab.markers.config import FRAME_MARKER_CFG
+from isaaclab.markers.config import FRAME_MARKER_CFG, VisualizationMarkersCfg
 from isaaclab.utils import configclass
-from isaaclab.utils.math import subtract_frame_transforms
+from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms, quat_apply, quat_from_angle_axis
 
 from pxr import UsdPhysics, PhysxSchema
 import omni.physx
 import omni.usd
+
+from tacman_utils.sim_consts import CONTACT_AREAS, CONTACT_THRES
 
 PWD = os.path.dirname(os.path.abspath(__file__))
 
@@ -135,7 +137,9 @@ def compute_grasp_pose(obj_id: str, env_idx: int):
 def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, task_configs: list):
     robot = scene["robot"]
     num_envs = scene.num_envs
-    
+    obj_id = TASK_IDS[0]
+    obj_config = all_configs[obj_id]
+    env_idx = 0
     print(f"[INFO]: Running {num_envs} environments with tasks: {TASK_IDS}")
 
     # Create controller
@@ -154,17 +158,82 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, tas
     base_marker_cfg.markers["frame"].scale = (0.15, 0.15, 0.15)
     base_marker = VisualizationMarkers(base_marker_cfg.replace(prim_path="/Visuals/robot_base"))
 
-    # Compute ACTUAL grasp poses from object configuration
+    # Contact area markers (small spheres)
+    BLUE_VISUAL_MATERIAL = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0))
+    # RED_VISUAL_MATERIAL = sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))
+    
+    contact_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/ContactMarkers",
+        markers={
+            "sphere": sim_utils.SphereCfg(
+                radius=0.003,
+                visual_material=BLUE_VISUAL_MATERIAL,
+            )
+        }
+    )
+    contact_markers = VisualizationMarkers(contact_marker_cfg)
+
+    # green markers for displacement
+    GREEN_VISUAL_MATERIAL = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
+    
+    displacement_marker_cfg = VisualizationMarkersCfg(
+        prim_path="/Visuals/DisplacementMarkers",
+        markers={
+            "sphere": sim_utils.SphereCfg(
+                radius=0.005,
+                visual_material=GREEN_VISUAL_MATERIAL,
+            )
+        }
+    )
+    displacement_markers = VisualizationMarkers(displacement_marker_cfg)
+    
+    l_finger_kpt = torch.tensor(CONTACT_AREAS["panda"]["L"], dtype=torch.float32, device=sim.device)
+    r_finger_kpt = torch.tensor(CONTACT_AREAS["panda"]["R"], dtype=torch.float32, device=sim.device)
+    
+    finger_xx = torch.linspace(0, 1, 10, device=sim.device)
+    finger_yy = torch.linspace(0, 1, 10, device=sim.device)
+    
+    finger_grid = torch.stack(torch.meshgrid(finger_xx, finger_yy, indexing='ij'), dim=-1).reshape(-1, 2)
+    
+    # Compute marker positions in finger local frame
+    l_finger_markers = (l_finger_kpt[0].unsqueeze(0) + 
+                        finger_grid[:, 0:1] * (l_finger_kpt[1] - l_finger_kpt[0]).unsqueeze(0) + 
+                        finger_grid[:, 1:2] * (l_finger_kpt[3] - l_finger_kpt[0]).unsqueeze(0))
+    
+    r_finger_markers = (r_finger_kpt[0].unsqueeze(0) + 
+                        finger_grid[:, 0:1] * (r_finger_kpt[1] - r_finger_kpt[0]).unsqueeze(0) + 
+                        finger_grid[:, 1:2] * (r_finger_kpt[3] - r_finger_kpt[0]).unsqueeze(0))
+    
+    print(f"[INFO]: Created {len(l_finger_markers)} markers per finger")
+
+    # Load handle mesh for contact detection
+    import trimesh as tm
+    handle_mesh = tm.load(os.path.join(PWD, obj_config['grasp_part_mesh']), force='mesh') # in object coordinate frame
+    scale_matrix = np.eye(4)
+    scale_matrix[0, 0] = args_cli.obj_scale
+    scale_matrix[1, 1] = args_cli.obj_scale
+    scale_matrix[2, 2] = args_cli.obj_scale
+    handle_mesh.apply_transform(scale_matrix)
+
+    handle_pt = torch.tensor(handle_mesh.sample(4096), dtype=torch.float32, device=sim.device)
+    print(f"[INFO]: Loaded handle mesh with {len(handle_pt)} points")
+
+    # Contact tracking variables
+    locked_marker_idx = None
+    init_marker_pos_world = None
+    handle_marker_bound_pos = None
+
+    # Compute grasp poses from object configuration
     grasp_poses = []
-    for i, obj_id in enumerate(TASK_IDS[:num_envs]):
-        p, r = compute_grasp_pose(obj_id, i)
+    for i, task_obj_id in enumerate(TASK_IDS[:num_envs]):
+        p, r = compute_grasp_pose(task_obj_id, i)
         grasp_poses.append(np.concatenate([p, r]))
     
     grasp_poses_w = torch.tensor(np.array(grasp_poses), device=sim.device, dtype=torch.float32)
     print(f"[INFO]: Target grasp poses (world): {grasp_poses_w}")
     
-    # Create waypoint (offset back in world X)
-    waypoint_offset = 0.15  # 15cm up and back
+    # Create waypoint
+    waypoint_offset = 0.15 
     waypoint_poses_w = grasp_poses_w.clone()
     waypoint_poses_w[:, 0] -= waypoint_offset
     waypoint_poses_w[:, 2] += waypoint_offset
@@ -183,18 +252,19 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, tas
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
     count = 0
-    
-    # Track phase (0=waypoint, 1=grasp, 2=hold)
-    phase = 0
+    phase = 0 # (0=waypoint, 1=grasp, 2=hold)
     
     print("[INFO]: Starting IK control loop...")
     
+    marker_data = []
+
     # Simulation loop
     while simulation_app.is_running():
         # Reset periodically for testing
         if count % 450 == 0:  # Full cycle: 150 (waypoint) + 150 (grasp) + 150 (hold)
             count = 0
             phase = 0
+            locked_marker_idx = None
             print(f"\n[INFO]: Resetting to initial state...")
             
             # Reset robot
@@ -220,7 +290,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, tas
             
         # Phase transitions within cycle
         elif count == 150 and phase == 0:
-            # Switch from waypoint to grasp
             phase = 1
             target_poses = grasp_poses_w
             
@@ -233,7 +302,6 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, tas
             diff_ik_controller.set_command(torch.cat([target_pos_b, target_quat_b], dim=-1))
             
         elif count == 300 and phase == 1:
-            # Switch to hold phase
             phase = 2
             
             # Close gripper over next 30 steps
@@ -301,6 +369,121 @@ def run_simulator(sim: sim_utils.SimulationContext, scene: InteractiveScene, tas
         waypoint_marker.visualize(waypoint_poses_w[:, 0:3], waypoint_poses_w[:, 3:7])
         goal_marker.visualize(grasp_poses_w[:, 0:3], grasp_poses_w[:, 3:7])
         base_marker.visualize(root_pose_w[:, 0:3], root_pose_w[:, 3:7])
+
+        # Visualize contact markers (right finger only for now)
+        # Get right finger body index
+        if count == 1:
+            grasp_link = obj_config['grasp_link']
+
+            finger_entity_cfg = SceneEntityCfg("robot", body_names=["panda_rightfinger"])
+            finger_entity_cfg.resolve(scene)
+            r_finger_body_idx = finger_entity_cfg.body_ids[0]
+
+            obj_entity_cfg = SceneEntityCfg(f"object_{env_idx}", body_names=[grasp_link])
+            obj_entity_cfg.resolve(scene)
+            handle_body_idx = obj_entity_cfg.body_ids[0]
+        
+        if count > 0:
+            # Transform markers to world frame
+            r_finger_pose_w = robot.data.body_state_w[:, r_finger_body_idx, 0:7]
+            r_finger_pos = r_finger_pose_w[:, 0:3]
+            r_finger_quat = r_finger_pose_w[:, 3:7]
+            
+            # Transform markers (simple version - just position for now)
+            r_markers_world = quat_apply(r_finger_quat.repeat(len(r_finger_markers), 1), 
+                                         r_finger_markers.repeat(num_envs, 1)) + r_finger_pos.repeat(len(r_finger_markers), 1)
+            
+            # Transform handle points to world
+            handle_pose_w = scene[f"object_{env_idx}"].data.body_state_w[:, handle_body_idx, 0:7]
+            handle_pos_w = handle_pose_w[:, 0:3]
+            handle_quat_w = handle_pose_w[:, 3:7]
+            handle_pt_world = quat_apply(handle_quat_w.repeat(len(handle_pt), 1),
+                                         handle_pt.repeat(num_envs, 1)) + handle_pos_w.repeat(len(handle_pt), 1)
+            
+            # TODO: remove later
+            if count % 100 == 0 and phase == 2:
+                print(f"\n[DEBUG Step {count}]")
+                print(f"  Finger pos: {r_finger_pos[0]}")
+                print(f"  Handle pos: {handle_pos_w[0]}")
+                print(f"  Finger markers range: [{r_markers_world[:, 0].min():.3f}, {r_markers_world[:, 0].max():.3f}]")
+                print(f"  Handle points range:  [{handle_pt_world[:, 0].min():.3f}, {handle_pt_world[:, 0].max():.3f}]")
+                print(f"  Distance between centers: {torch.norm(r_finger_pos[0] - handle_pos_w[0]).item():.4f}m")
+
+            # Detect contact
+            if phase == 2:
+                dist = torch.cdist(handle_pt_world.unsqueeze(0), r_markers_world.unsqueeze(0)).squeeze(0)
+                finger_to_handle_dist = dist.min(dim=0)[0]
+                finger_marker_contact = finger_to_handle_dist < CONTACT_THRES
+                print(f"[CONTACT] Finger to handle distance: {finger_to_handle_dist.mean().item():.4f}m")
+                print(f"[CONTACT] Markers in contact: {finger_marker_contact.float().sum().item()}/{len(r_finger_markers)}")
+                
+                # Lock markers on first contact
+                if locked_marker_idx is None and finger_marker_contact.float().mean() > 0.1:
+                    locked_marker_idx = torch.where(finger_marker_contact)[0]
+                    print(f"[CONTACT] Locked {len(locked_marker_idx)} markers")
+                    
+                    # Save initial positions
+                    init_marker_pos_world = r_markers_world[locked_marker_idx].clone()
+                    
+                    # Save positions relative to handle
+                    locked_marker_pos_homo = torch.cat([
+                        r_markers_world[locked_marker_idx],
+                        torch.ones(len(locked_marker_idx), 1, device=sim.device)
+                    ], dim=-1)
+                    
+                    handle_transf = torch.eye(4, device=sim.device)
+                    handle_transf[:3, :3] = matrix_from_quat(handle_quat_w[0])
+                    handle_transf[:3, 3] = handle_pos_w[0]
+                    
+                    handle_marker_bound_pos = torch.matmul(
+                        torch.inverse(handle_transf),
+                        locked_marker_pos_homo.T
+                    ).T[:, :3]
+                
+                # Track displacement if markers are locked
+                if locked_marker_idx is not None:
+                    # Current marker positions (bound to handle)
+                    handle_transf = torch.eye(4, device=sim.device)
+                    handle_transf[:3, :3] = matrix_from_quat(handle_quat_w[0])
+                    handle_transf[:3, 3] = handle_pos_w[0]
+                    
+                    locked_pos_homo = torch.cat([
+                        handle_marker_bound_pos,
+                        torch.ones(len(handle_marker_bound_pos), 1, device=sim.device)
+                    ], dim=-1)
+                    
+                    curr_marker_pos_world = torch.matmul(handle_transf, locked_pos_homo.T).T[:, :3]
+                    
+                    # Compute displacement
+                    displacement = curr_marker_pos_world - init_marker_pos_world
+                    displacement_mag = displacement.norm(dim=-1)
+                    
+                    if count % 50 == 0:
+                        print(f"[DISPLACEMENT] Mean: {displacement_mag.mean().item():.4f}m, Max: {displacement_mag.max().item():.4f}m")
+                        
+                        # Save for offline viz
+                        marker_data.append({
+                            'step': count,
+                            'init_pos': init_marker_pos_world.cpu(),
+                            'curr_pos': curr_marker_pos_world.cpu(),
+                            'displacement': displacement.cpu()
+                        })
+                    
+                    displacement_markers.visualize(
+                        curr_marker_pos_world,
+                        torch.tensor([[1, 0, 0, 0]], device=sim.device).repeat(len(curr_marker_pos_world), 1)
+                    )
+            
+            # Visualize all markers
+            contact_markers.visualize(r_markers_world, 
+                                     torch.tensor([[1, 0, 0, 0]], device=sim.device).repeat(len(r_markers_world), 1))
+    
+        # Save data at end
+        if count % 449 == 0:
+            if len(marker_data) > 0:
+                torch.save(marker_data, f"{PWD}/marker_displacement_data.pt")
+                print(f"[INFO]: Saved {len(marker_data)} frames to marker_displacement_data.pt")
+
 
 def main():
     sim_cfg = sim_utils.SimulationCfg(dt=0.01, device=args_cli.device)
