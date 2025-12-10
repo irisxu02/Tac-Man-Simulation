@@ -65,6 +65,8 @@ delta_0 = 0.002 # 0.0004
 alpha = 0.6
 
 NUM_STEPS = 5000 # episode length
+ROT_SUCCESS_THRES = 60.0  # degrees
+PRISMATIC_SUCCESS_THRES = 0.25  # meters
 
 @configclass
 class ManipulationSceneCfg(InteractiveSceneCfg):
@@ -640,6 +642,23 @@ def run_simulator(
                 joint_min = art_joint_limits[0].item()
                 joint_max = art_joint_limits[1].item()
                 joint_pos = obj_articulation.data.joint_pos.squeeze()[target_joint_idx].item()
+                joint_type = obj_config["joint_type"]
+                if joint_type == "hinge":  # revolute
+                    moved = abs(joint_pos - joint_min)
+                    moved_deg = moved * 180.0 / np.pi
+                    if moved_deg >= ROT_SUCCESS_THRES:
+                        sim_state.state = STATE_SUCC
+                        print(f"[INFO] {target_joint_name} rotated {moved_deg:.2f} deg (>{ROT_SUCCESS_THRES}), SUCCESS.")
+                        lock_joint_drive()
+                        continue
+                elif joint_type == "slider":  # prismatic
+                    moved = abs(joint_pos - joint_min)
+                    if moved >= PRISMATIC_SUCCESS_THRES:
+                        sim_state.state = STATE_SUCC
+                        print(f"[INFO] {target_joint_name} extended {moved:.2f} m (>{PRISMATIC_SUCCESS_THRES}), SUCCESS.")
+                        lock_joint_drive()
+                        continue
+                # shouldn't hit max, but include for safety
                 margin = 0.01 * abs(joint_max - joint_min)
                 if joint_pos >= joint_max - margin:
                     sim_state.state = STATE_SUCC
