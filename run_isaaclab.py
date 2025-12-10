@@ -30,7 +30,7 @@ from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg
 from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.controllers import DifferentialIKController, DifferentialIKControllerCfg
-from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG
+from isaaclab_assets.robots.franka import FRANKA_PANDA_HIGH_PD_CFG, FRANKA_PANDA_CFG
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.markers.config import FRAME_MARKER_CFG, VisualizationMarkersCfg
@@ -61,9 +61,10 @@ TASK_IDS = [args_cli.idx]
 
 STATE_INIT, STATE_PROC, STATE_RECV, STATE_SUCC = -1, 0, 1, 2
 
-delta_0 = 0.0004
+delta_0 = 0.002 # 0.0004
 alpha = 0.6
 
+NUM_STEPS = 5000 # episode length
 
 @configclass
 class ManipulationSceneCfg(InteractiveSceneCfg):
@@ -162,7 +163,6 @@ class SimulationState:
             handle_transf, self.handle_marker_bound_pos.T
         ).T[:, :3]
 
-        # Current marker positions in hand frame
         curr_marker_pos_homo = torch.cat(
             [
                 self.curr_marker_pos_world,
@@ -183,8 +183,12 @@ class SimulationState:
         )
 
         # Rigid alignment using Kabsch algorithm
+        curr_hand_markers_world = torch.matmul(
+            hand_transf, self.init_marker_pos.T
+        ).T[:, :3]
+
         self.marker_dspl_r, marker_dspl_t = find_rigid_alignment(
-            self.init_marker_pos_world, self.curr_marker_pos_world
+            curr_hand_markers_world, self.curr_marker_pos_world
         )
 
         self.marker_dspl_transf = torch.eye(4, device=self.device)
@@ -217,11 +221,11 @@ def create_object_cfg(obj_id: str, env_idx: int = 0):
         ),
         init_state=ArticulationCfg.InitialStateCfg(
             pos=(obj_x, obj_y, obj_z),
-            joint_pos={"joint_0": 0.0, "joint_1": 0.0, "joint_2": 0.0, "joint_3": 0.0},
+            joint_pos={"joint_.*": 0.0},
         ),
         actuators={
             "joints": ImplicitActuatorCfg(
-                joint_names_expr=["joint_[0-9]"],
+                joint_names_expr=["joint_.*"],
                 stiffness=0.0,
                 damping=5.0,
             ),
@@ -259,8 +263,9 @@ def compute_grasp_pose(obj_id: str, env_idx: int):
 
 def get_proceeding_dir(hand_transf):
     num_envs = hand_transf.shape[0]
+    # TODO: test some random directions
     dir_local = (
-        torch.tensor([0.0, 0.0, -1.0], dtype=torch.float32, device=hand_transf.device)
+        torch.tensor([0.0, 1.0, -1.0], dtype=torch.float32, device=hand_transf.device)
         .unsqueeze(0)
         .tile([num_envs, 1])
     )
@@ -291,6 +296,32 @@ def run_simulator(
     obj_config = all_configs[obj_id]
     env_idx = 0
     print(f"[INFO]: Running {num_envs} environments with tasks: {TASK_IDS}")
+
+    # Get object articulation for joint drive control
+    obj_articulation = scene[f"object_{env_idx}"]
+    target_joint_name = obj_config['target_joint'].split("/")[-1]
+
+    # Find joint index in the object articulation by exact path match
+    obj_joint_names = obj_articulation.data.joint_names
+    assert target_joint_name in obj_joint_names, f"Target joint '{target_joint_name}' not found in object joints."
+    target_joint_idx = obj_joint_names.index(target_joint_name)
+    
+    # Get joint limits for the target joint
+    art_joint_limits = obj_articulation.data.joint_limits.squeeze()[target_joint_idx]
+
+    # TODO: support multiple target joints on different objects
+    def lock_joint_drive():
+        """Lock joint during recovery - high damping prevents movement"""
+        obj_articulation.write_joint_damping_to_sim(1e8, joint_ids=[target_joint_idx])
+        obj_articulation.write_joint_stiffness_to_sim(0.0, joint_ids=[target_joint_idx])
+        
+    def release_joint_drive():
+        """Release joint during execution - low damping allows movement"""
+        obj_articulation.write_joint_damping_to_sim(50.0, joint_ids=[target_joint_idx])
+        obj_articulation.write_joint_stiffness_to_sim(0.0, joint_ids=[target_joint_idx])
+
+    # Start with joint locked
+    lock_joint_drive()
 
     # Create controller
     diff_ik_cfg = DifferentialIKControllerCfg(
@@ -341,7 +372,7 @@ def run_simulator(
         prim_path="/Visuals/DisplacementMarkers",
         markers={
             "sphere": sim_utils.SphereCfg(
-                radius=0.005,
+                radius=0.0005,
                 visual_material=GREEN_VISUAL_MATERIAL,
             )
         },
@@ -449,19 +480,38 @@ def run_simulator(
 
     print("[INFO]: Starting IK control loop...")
 
+    # Define PD gains
+    # high for reaching and recovery
+    STIFF_KP = 400.0 
+    STIFF_KD = 80.0
+    
+    # low for more compliant manipulation in proc
+    SOFT_KP = 80.0
+    SOFT_KD = 4.0
+
     marker_data = []
 
-    # Simulation loop
     while simulation_app.is_running():
-        # Reset periodically for testing
-        # Phase 0: 150 (waypoint) + Phase 1: 150 (grasp) + Phase 2: 30 (close gripper) and until end execution/recovery
-        if count % 2500 == 0 or sim_state.state == STATE_SUCC:
+        # Phase 0: 150 (waypoint) + Phase 1: 150 (grasp) + Phase 2: 50 (close gripper) and until end execution/recovery
+        if count % NUM_STEPS == 0 or sim_state.state == STATE_SUCC:
             phase = 0
             sim_state.locked_marker_idx = None
             sim_state.state = STATE_INIT
-            print(f"\n[INFO]: Resetting to initial state...")  # TODO: reset object pose
+            lock_joint_drive()
+            print(f"\n[INFO]: Resetting to initial state...")
+
+            # Reset objects
+            for i in range(num_envs):
+                obj = scene[f"object_{i}"]
+                obj.write_root_pose_to_sim(obj.data.default_root_state[:, :7])
+                obj.write_joint_state_to_sim(
+                    obj.data.default_joint_pos, 
+                    obj.data.default_joint_vel
+                )
 
             # Reset robot
+            robot.write_joint_stiffness_to_sim(STIFF_KP, joint_ids=robot_entity_cfg.joint_ids)
+            robot.write_joint_damping_to_sim(STIFF_KD, joint_ids=robot_entity_cfg.joint_ids)
             joint_pos = robot.data.default_joint_pos.clone()
             joint_vel = robot.data.default_joint_vel.clone()
             robot.write_joint_state_to_sim(joint_pos, joint_vel)
@@ -509,9 +559,9 @@ def run_simulator(
             phase = 2
             print(f"[PHASE 2]: Closing gripper...")
 
-            # Close gripper over next 30 steps
-            for close_step in range(30):
-                alpha_close = (close_step + 1) / 30.0
+            # Close gripper over next 50 steps
+            for close_step in range(50):
+                alpha_close = (close_step + 1) / 50.0
                 gripper_pos = (
                     gripper_open * (1 - alpha_close) + gripper_closed * alpha_close
                 )
@@ -528,6 +578,9 @@ def run_simulator(
 
             # Initialize manipulation state
             sim_state.state = STATE_PROC
+            robot.write_joint_stiffness_to_sim(SOFT_KP, joint_ids=robot_entity_cfg.joint_ids)
+            robot.write_joint_damping_to_sim(SOFT_KD, joint_ids=robot_entity_cfg.joint_ids)
+            print(f"[CONTROL]: Lowered PD gains for compliance.")
             sim_state.grasp_q = robot.data.joint_pos[:, 7:9].clone()
 
             hand_pose_w = robot.data.body_pose_w[:, hand_body_idx]
@@ -537,6 +590,7 @@ def run_simulator(
             sim_state.curr_proceed_base_transf = hand_transf.clone()
             sim_state.curr_proceed_dir = get_proceeding_dir(hand_pose_w)
 
+            release_joint_drive()
             print(f"[PHASE 2]: Starting manipulation (STATE_PROC)...")
 
         # Compute IK if in waypoint or grasp phase
@@ -581,6 +635,18 @@ def run_simulator(
                 handle_pose_w[0, :3], handle_pose_w[0, 3:7], sim.device
             )
 
+            # TODO: check joint limits to stop manipulation
+            if art_joint_limits is not None:
+                joint_min = art_joint_limits[0].item()
+                joint_max = art_joint_limits[1].item()
+                joint_pos = obj_articulation.data.joint_pos.squeeze()[target_joint_idx].item()
+                margin = 0.01 * abs(joint_max - joint_min)
+                if joint_pos >= joint_max - margin:
+                    sim_state.state = STATE_SUCC
+                    print(f"[INFO] {target_joint_name} reached limit ({joint_pos:.4f}), stopping manipulation.")
+                    lock_joint_drive()
+                    continue
+            
             # Transform finger markers to world frame
             r_finger_pose_w = robot.data.body_state_w[:, r_finger_body_idx, 0:7]
             r_markers_world = quat_apply(
@@ -625,12 +691,18 @@ def run_simulator(
                     sim_state.recv_stuck_count = 0
                     sim_state.curr_proceed_base_transf = hand_transf.clone()
                     sim_state.curr_proceed_dir = get_proceeding_dir(hand_pose_w)
+                    release_joint_drive()
+                    robot.write_joint_stiffness_to_sim(SOFT_KP, joint_ids=robot_entity_cfg.joint_ids)
+                    robot.write_joint_damping_to_sim(SOFT_KD, joint_ids=robot_entity_cfg.joint_ids)
                     print(
                         f"[Step {count}] RECV -> PROC (dspl={sim_state.marker_dspl_dist:.6f})"
                     )
 
                 if next_recv:
                     sim_state.state = STATE_RECV
+                    lock_joint_drive()
+                    robot.write_joint_stiffness_to_sim(STIFF_KP, joint_ids=robot_entity_cfg.joint_ids)
+                    robot.write_joint_damping_to_sim(STIFF_KD, joint_ids=robot_entity_cfg.joint_ids)
                     print(
                         f"[Step {count}] PROC -> RECV (dspl={sim_state.marker_dspl_dist:.6f})"
                     )
@@ -647,9 +719,7 @@ def run_simulator(
 
                     recv_accept = torch.det(sim_state.marker_dspl_r) > 0.9999
                     if recv_accept:
-                        target_transf = torch.matmul(
-                            sim_state.marker_dspl_transf, hand_transf
-                        ).float()
+                        target_transf = torch.matmul(sim_state.marker_dspl_transf, hand_transf).float()
 
                     # Stuck recovery
                     if sim_state.recv_stuck_count % 250 == 249:
@@ -676,6 +746,7 @@ def run_simulator(
                         "state": "RECV" if sim_state.state == STATE_RECV else "PROC",
                         "init_pos": sim_state.init_marker_pos.cpu(),
                         "curr_pos": curr_marker_pos_hand.cpu(),
+                        "unlocked_pos": sim_state.unlocked_marker_pos.cpu(), 
                         "displacement": sim_state.marker_dspl_dist,
                     }
                 )
@@ -722,7 +793,11 @@ def run_simulator(
             robot.set_joint_position_target(
                 joint_pos_des, joint_ids=robot_entity_cfg.joint_ids
             )
-            robot.set_joint_position_target(gripper_closed, joint_ids=slice(7, 9))
+            if sim_state.state == STATE_RECV:
+                # Maintain the width recorded at grasp onset to allow pivoting
+                robot.set_joint_position_target(sim_state.grasp_q, joint_ids=slice(7, 9))
+            else:
+                robot.set_joint_position_target(gripper_closed, joint_ids=slice(7, 9))
 
         # Step simulation
         scene.write_data_to_sim()
@@ -753,12 +828,12 @@ def run_simulator(
                 )
 
         # Visualize
-        ee_pose_w = robot.data.body_state_w[:, ee_body_idx, 0:7]
-        root_pose_w = robot.data.root_pose_w
-        ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
-        waypoint_marker.visualize(waypoint_poses_w[:, 0:3], waypoint_poses_w[:, 3:7])
-        goal_marker.visualize(grasp_poses_w[:, 0:3], grasp_poses_w[:, 3:7])
-        base_marker.visualize(root_pose_w[:, 0:3], root_pose_w[:, 3:7])
+        # ee_pose_w = robot.data.body_state_w[:, ee_body_idx, 0:7]
+        # root_pose_w = robot.data.root_pose_w
+        # ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
+        # waypoint_marker.visualize(waypoint_poses_w[:, 0:3], waypoint_poses_w[:, 3:7])
+        # goal_marker.visualize(grasp_poses_w[:, 0:3], grasp_poses_w[:, 3:7])
+        # base_marker.visualize(root_pose_w[:, 0:3], root_pose_w[:, 3:7])
 
         # Contact markers visualization
         if phase >= 2:
@@ -799,7 +874,7 @@ def main():
 
     scene = InteractiveScene(scene_cfg)
     sim.reset()
-    
+
     # Run simulator
     run_simulator(sim, scene, task_configs)
 
