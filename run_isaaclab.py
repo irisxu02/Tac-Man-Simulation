@@ -18,21 +18,25 @@ parser.add_argument("--z_offset", default=0.0, type=float)
 
 parser.add_argument(
     "--exec_dir",
-    nargs=3,
-    type=float,
-    default=[0.0, 0.0, -1.0],
-    help="Initial execution direction (x y z)",
+    type=str,
+    default="[0.0, 0.0, -1.0]",
+    help="Initial execution direction (x y z) as a list, e.g. '[0,0,-1]'",
 )
 parser.add_argument(
     "--grasp_offset",
-    nargs=3,
-    type=float,
-    default=[0.0, 0.0, 0.0],
-    help="Offset to add to grasp position (x y z)",
+    type=str,
+    default="[0.0, 0.0, 0.0]",
+    help="Offset to add to grasp position (x y z) as a list, e.g. '[0,0,0]'",
 )
+
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
+
+# Parse exec_dir and grasp_offset from string to list of floats
+import ast
+args_cli.exec_dir = [float(x) for x in ast.literal_eval(args_cli.exec_dir)]
+args_cli.grasp_offset = [float(x) for x in ast.literal_eval(args_cli.grasp_offset)]
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
