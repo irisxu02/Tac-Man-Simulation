@@ -78,11 +78,17 @@ all_grasps = {k: v for k, v in all_grasps.items() if v != {}}
 TASK_IDS = [args_cli.idx]
 
 STATE_INIT, STATE_PROC, STATE_RECV, STATE_SUCC = -1, 0, 1, 2
+TRANSITION_MAP = {
+    -1: "Stuck Recovery",
+    0: "INIT -> PROC",
+    1: "RECV -> PROC",
+    2: "PROC -> RECV",
+}
 
 delta_0 = 0.002  # 0.0004
 alpha = 0.6
 
-NUM_STEPS = 5000  # episode length
+NUM_STEPS = 8000  # episode length
 ROT_SUCCESS_THRES = 60.0  # degrees
 PRISMATIC_SUCCESS_THRES = 0.25  # meters
 
@@ -267,7 +273,7 @@ class SimulationState:
     def update_state(
         self, hand_transf, handle_transf, robot, joint_ids, proceeding_dir
     ):
-        transition_msg = ""
+        transition = None
         target_transf = hand_transf.clone()
 
         if self.state == STATE_INIT:
@@ -278,7 +284,7 @@ class SimulationState:
             self.curr_proceed_dir = proceeding_dir
             self.release_joint_drive()
             self.grasp_q = robot.data.joint_pos[:, 7:9].clone()
-            transition_msg = "INIT -> PROC"
+            transition = 0
 
         next_recv = self.state == STATE_PROC and (self.marker_dspl_dist > delta_0)
         next_proc = self.state == STATE_RECV and (
@@ -294,14 +300,14 @@ class SimulationState:
             self.release_joint_drive()
             robot.write_joint_stiffness_to_sim(SOFT_KP, joint_ids=joint_ids)
             robot.write_joint_damping_to_sim(SOFT_KD, joint_ids=joint_ids)
-            transition_msg = f"RECV -> PROC (dspl={self.marker_dspl_dist:.6f})"
+            transition = 1
 
         if next_recv:
             self.state = STATE_RECV
             self.lock_joint_drive()
             robot.write_joint_stiffness_to_sim(STIFF_KP, joint_ids=joint_ids)
             robot.write_joint_damping_to_sim(STIFF_KD, joint_ids=joint_ids)
-            transition_msg = f"PROC -> RECV (dspl={self.marker_dspl_dist:.6f})"
+            transition = 2
 
         # Compute target based on state
         if self.state == STATE_PROC:
@@ -320,15 +326,14 @@ class SimulationState:
                 target_transf += torch.normal(
                     0, 0.01, size=target_transf.shape, device=self.device
                 )
-                transition_msg = "Stuck, applying noise"
+                transition = -1
 
-        return target_transf, transition_msg
+        return target_transf, transition
 
     def check_success(self, joint_type=None):
         if self.is_success():
             return True
         if self.state != STATE_PROC:
-            print("warning: not in processing state, cannot check success.")
             return False
 
         success = False
@@ -599,7 +604,7 @@ def run_simulator(
     print("[INFO]: Starting IK control loop...")
     count = 0
     phase = 0
-    
+
     marker_data = []
     results = {}
     # Load existing results if present
@@ -613,26 +618,34 @@ def run_simulator(
     else:
         all_results = {}
 
+    obj_idx = str(obj_id)
+    if obj_idx not in all_results:
+        all_results[obj_idx] = {}
+
     while simulation_app.is_running():
         # Phase 0: 150 (waypoint) + Phase 1: 150 (grasp) + Phase 2: 50 (close gripper) and until end execution/recovery
         if count % NUM_STEPS == 0 or sim_state.is_success():
-            # Save final data from previous trial
-            fname = f"{PWD}/marker_data_trial_{sim_state.trial_number}.pt"
-            torch.save(marker_data, fname)
-            print(f"[INFO]: Saved {len(marker_data)} frames to {fname}")
-            # Save results for this trial
-            trial_num = str(sim_state.trial_number)
-            all_results[trial_num] = results
-            with open(results_path, "w") as f:
-                json.dump(all_results, f, indent=2)
+            if len(marker_data) > 0:
+                # Save final data from previous trial
+                fname = f"{PWD}/marker_data/{obj_idx}_trial_{sim_state.trial_number}.pt"
+                torch.save(marker_data, fname)
+                print(f"[INFO]: Saved {len(marker_data)} frames to {fname}")
+            if results != {}:
+                trial_num = str(sim_state.trial_number)
+                # Save under all_results[obj_idx][trial_num]
+                if obj_idx not in all_results:
+                    all_results[obj_idx] = {}
+                all_results[obj_idx][trial_num] = results
+                with open(results_path, "w") as f:
+                    json.dump(all_results, f, indent=2)
+                print(f"[INFO]: Saved results for object {obj_idx} trial {trial_num} to {results_path}")
 
             count = 0
-            phase = 0   
+            phase = 0
             marker_data = []
             results = {}
-            
+
             sim_state.new_attempt()
-            results["trial_number"] = sim_state.trial_number
             results["grasp_offset"] = args_cli.grasp_offset
             results["exec_direction"] = args_cli.exec_dir
             print(f"\n[INFO]: Resetting to initial state...")
@@ -720,15 +733,15 @@ def run_simulator(
                 hand_pose_w[0, :3], hand_pose_w[0, 3:7], sim.device
             )
 
-            _, transition_msg = sim_state.update_state(
+            _, transition = sim_state.update_state(
                 hand_transf,
                 None,
                 robot,
                 robot_entity_cfg.joint_ids,
                 get_proceeding_dir(hand_pose_w),
             )
-            if transition_msg != "":
-                print(transition_msg)
+            if transition is not None:
+                print(TRANSITION_MAP.get(transition, "Unknown transition"))
             manip_start_step = count
 
         # Compute IK if in waypoint or grasp phase
@@ -805,6 +818,17 @@ def run_simulator(
                     sim_state.lock_markers(
                         contact_idx, r_markers_world, handle_transf, hand_transf
                     )
+                    marker_data.append(
+                        {
+                            "t": count * sim_dt,
+                            "state": "INIT",
+                            "init_pos": sim_state.init_marker_pos.cpu(),
+                            "curr_pos": sim_state.init_marker_pos.cpu(),
+                            "unlocked_pos": sim_state.unlocked_marker_pos.cpu(),
+                            "displacement": None,
+                        }
+                    )
+
 
             # Compute target transformation
             target_transf = hand_transf.clone()
@@ -812,15 +836,15 @@ def run_simulator(
             if sim_state.locked_marker_idx is not None:
                 sim_state.compute_displacement(handle_transf, hand_transf)
 
-                target_transf, transition_msg = sim_state.update_state(
+                target_transf, transition = sim_state.update_state(
                     hand_transf,
                     handle_transf,
                     robot,
                     robot_entity_cfg.joint_ids,
                     get_proceeding_dir(hand_pose_w),
                 )
-                if transition_msg != "":
-                    print(transition_msg)
+                if transition is not None:
+                    print(TRANSITION_MAP.get(transition, "Unknown transition"))
 
                 curr_marker_pos_homo = torch.cat(
                     [
@@ -836,7 +860,7 @@ def run_simulator(
                 ).T
 
                 # TODO: only collect frame when transitioning from RECV to PROC or vice versa
-                if transition_msg == "INIT -> PROC" or transition_msg == "PROC -> RECV":
+                if transition == 1 or transition == 2:
                     marker_data.append(
                         {
                             "t": count * sim_dt,
