@@ -6,6 +6,7 @@ import json
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Isaac Lab Manipulation Script")
+
 parser.add_argument("--idx", default="46466", type=str)
 parser.add_argument("--obj_scale", default=0.5, type=float)
 parser.add_argument(
@@ -14,6 +15,21 @@ parser.add_argument(
 parser.add_argument("--x_offset", default=0.75, type=float)
 parser.add_argument("--y_offset", default=0.0, type=float)
 parser.add_argument("--z_offset", default=0.0, type=float)
+
+parser.add_argument(
+    "--exec_dir",
+    nargs=3,
+    type=float,
+    default=[0.0, 0.0, -1.0],
+    help="Initial execution direction (x y z)",
+)
+parser.add_argument(
+    "--grasp_offset",
+    nargs=3,
+    type=float,
+    default=[0.0, 0.0, 0.0],
+    help="Offset to add to grasp position (x y z)",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
@@ -46,6 +62,8 @@ from pxr import UsdPhysics, PhysxSchema
 import omni.physx
 import omni.usd
 
+import trimesh as tm
+
 from tacman_utils.sim_consts import CONTACT_AREAS, CONTACT_THRES
 from tacman_utils.utils_3d import find_rigid_alignment
 
@@ -61,12 +79,22 @@ TASK_IDS = [args_cli.idx]
 
 STATE_INIT, STATE_PROC, STATE_RECV, STATE_SUCC = -1, 0, 1, 2
 
-delta_0 = 0.002 # 0.0004
+delta_0 = 0.002  # 0.0004
 alpha = 0.6
 
-NUM_STEPS = 5000 # episode length
+NUM_STEPS = 5000  # episode length
 ROT_SUCCESS_THRES = 60.0  # degrees
 PRISMATIC_SUCCESS_THRES = 0.25  # meters
+
+# Define PD gains
+# high for reaching and recovery
+STIFF_KP = 400.0
+STIFF_KD = 80.0
+
+# low for more compliant manipulation in proc
+SOFT_KP = 80.0
+SOFT_KD = 4.0
+
 
 @configclass
 class ManipulationSceneCfg(InteractiveSceneCfg):
@@ -93,6 +121,7 @@ class SimulationState:
         self.num_envs = num_envs
         self.device = device
         self.state = STATE_INIT
+        self.trial_number = 0
 
         # Marker tracking
         self.locked_marker_idx = None
@@ -114,6 +143,19 @@ class SimulationState:
         self.curr_proceed_dir = None
         self.curr_proceed_base_transf = None
         self.grasp_q = None
+
+        # For joint drive control
+        self.obj_articulation = None
+        self.target_joint_idx = None
+
+    def new_attempt(self):
+        self.locked_marker_idx = None
+        self.state = STATE_INIT
+        self.trial_number += 1
+        self.attempt_counter = 0
+        self.recv_stuck_count = 0
+
+        self.lock_joint_drive()
 
     def lock_markers(self, contact_idx, marker_pos_world, handle_transf, hand_transf):
         """Lock markers on first contact detection"""
@@ -185,9 +227,9 @@ class SimulationState:
         )
 
         # Rigid alignment using Kabsch algorithm
-        curr_hand_markers_world = torch.matmul(
-            hand_transf, self.init_marker_pos.T
-        ).T[:, :3]
+        curr_hand_markers_world = torch.matmul(hand_transf, self.init_marker_pos.T).T[
+            :, :3
+        ]
 
         self.marker_dspl_r, marker_dspl_t = find_rigid_alignment(
             curr_hand_markers_world, self.curr_marker_pos_world
@@ -198,6 +240,125 @@ class SimulationState:
         self.marker_dspl_transf[:3, 3] = marker_dspl_t
 
         return True
+
+    def is_success(self):
+        return self.state == STATE_SUCC
+
+    def set_joint_drive_target(self, obj_articulation, target_joint_idx):
+        self.obj_articulation = obj_articulation
+        self.target_joint_idx = target_joint_idx
+
+    def lock_joint_drive(self):
+        self.obj_articulation.write_joint_damping_to_sim(
+            1e8, joint_ids=[self.target_joint_idx]
+        )
+        self.obj_articulation.write_joint_stiffness_to_sim(
+            0.0, joint_ids=[self.target_joint_idx]
+        )
+
+    def release_joint_drive(self):
+        self.obj_articulation.write_joint_damping_to_sim(
+            50.0, joint_ids=[self.target_joint_idx]
+        )
+        self.obj_articulation.write_joint_stiffness_to_sim(
+            0.0, joint_ids=[self.target_joint_idx]
+        )
+
+    def update_state(
+        self, hand_transf, handle_transf, robot, joint_ids, proceeding_dir
+    ):
+        transition_msg = ""
+        target_transf = hand_transf.clone()
+
+        if self.state == STATE_INIT:
+            self.state = STATE_PROC
+            self.attempt_counter = 0
+            self.recv_stuck_count = 0
+            self.curr_proceed_base_transf = hand_transf.clone()
+            self.curr_proceed_dir = proceeding_dir
+            self.release_joint_drive()
+            self.grasp_q = robot.data.joint_pos[:, 7:9].clone()
+            transition_msg = "INIT -> PROC"
+
+        next_recv = self.state == STATE_PROC and (self.marker_dspl_dist > delta_0)
+        next_proc = self.state == STATE_RECV and (
+            self.marker_dspl_dist < delta_0 * alpha
+        )
+
+        if next_proc:
+            self.state = STATE_PROC
+            self.attempt_counter += 1
+            self.recv_stuck_count = 0
+            self.curr_proceed_base_transf = hand_transf.clone()
+            self.curr_proceed_dir = proceeding_dir
+            self.release_joint_drive()
+            robot.write_joint_stiffness_to_sim(SOFT_KP, joint_ids=joint_ids)
+            robot.write_joint_damping_to_sim(SOFT_KD, joint_ids=joint_ids)
+            transition_msg = f"RECV -> PROC (dspl={self.marker_dspl_dist:.6f})"
+
+        if next_recv:
+            self.state = STATE_RECV
+            self.lock_joint_drive()
+            robot.write_joint_stiffness_to_sim(STIFF_KP, joint_ids=joint_ids)
+            robot.write_joint_damping_to_sim(STIFF_KD, joint_ids=joint_ids)
+            transition_msg = f"PROC -> RECV (dspl={self.marker_dspl_dist:.6f})"
+
+        # Compute target based on state
+        if self.state == STATE_PROC:
+            self.curr_proceed_base_transf[:3, 3] += self.curr_proceed_dir[0] * 0.0001
+            target_transf = self.curr_proceed_base_transf.clone()
+
+        elif self.state == STATE_RECV:
+            self.recv_stuck_count += 1
+            recv_accept = torch.det(self.marker_dspl_r) > 0.9999
+            if recv_accept:
+                target_transf = torch.matmul(
+                    self.marker_dspl_transf, hand_transf
+                ).float()
+            # Stuck recovery
+            if self.recv_stuck_count % 250 == 249:
+                target_transf += torch.normal(
+                    0, 0.01, size=target_transf.shape, device=self.device
+                )
+                transition_msg = "Stuck, applying noise"
+
+        return target_transf, transition_msg
+
+    def check_success(self, joint_type=None):
+        if self.is_success():
+            return True
+        if self.state != STATE_PROC:
+            print("warning: not in processing state, cannot check success.")
+            return False
+
+        success = False
+
+        # Get joint limits for the target joint
+        art_joint_limits = self.obj_articulation.data.joint_pos_limits.squeeze()[
+            self.target_joint_idx
+        ]
+        joint_min = art_joint_limits[0].item()
+        joint_max = art_joint_limits[1].item()
+        joint_pos = self.obj_articulation.data.joint_pos.squeeze()[
+            self.target_joint_idx
+        ].item()
+
+        moved = abs(joint_pos - joint_min)
+        if joint_type == "hinge" and (moved * 180.0 / np.pi) >= ROT_SUCCESS_THRES:
+            success = True
+        elif joint_type == "slider" and moved >= PRISMATIC_SUCCESS_THRES:
+            success = True
+
+        # shouldn't hit max, but include for safety
+        margin = 0.01 * abs(joint_max - joint_min)
+        if joint_pos >= joint_max - margin:
+            success = True
+            print("limit reached, stopping manipulation.")
+
+        if success:
+            self.state = STATE_SUCC
+            self.lock_joint_drive()
+        return success
 
 
 def create_object_cfg(obj_id: str, env_idx: int = 0):
@@ -246,8 +407,9 @@ def compute_grasp_pose(obj_id: str, env_idx: int):
     p = np.asarray(grasp_data["p"]) * args_cli.obj_scale
     p[0] += args_cli.x_offset + grasp_data.get("x_offset", 0.0)
     p[1] += args_cli.y_offset + grasp_data.get("y_offset", 0.0)
-    # p[0] += 0.046  # Offset for gripper
     p[2] += obj_config["height"] * args_cli.obj_scale + args_cli.z_offset
+
+    p += np.array(args_cli.grasp_offset)
 
     r_euler = grasp_data["R"]
 
@@ -265,12 +427,10 @@ def compute_grasp_pose(obj_id: str, env_idx: int):
 
 def get_proceeding_dir(hand_transf):
     num_envs = hand_transf.shape[0]
-    # TODO: test some random directions
-    dir_local = (
-        torch.tensor([0.0, 1.0, -1.0], dtype=torch.float32, device=hand_transf.device)
-        .unsqueeze(0)
-        .tile([num_envs, 1])
+    exec_dir = torch.tensor(
+        args_cli.exec_dir, dtype=torch.float32, device=hand_transf.device
     )
+    dir_local = exec_dir.unsqueeze(0).tile([num_envs, 1])
     dir_world = torch.zeros_like(dir_local)
     for i in range(num_envs):
         if hand_transf.shape[-1] == 7:
@@ -294,6 +454,7 @@ def run_simulator(
 ):
     robot = scene["robot"]
     num_envs = scene.num_envs
+
     obj_id = TASK_IDS[0]
     obj_config = all_configs[obj_id]
     env_idx = 0
@@ -301,29 +462,19 @@ def run_simulator(
 
     # Get object articulation for joint drive control
     obj_articulation = scene[f"object_{env_idx}"]
-    target_joint_name = obj_config['target_joint'].split("/")[-1]
+    target_joint_name = obj_config["target_joint"].split("/")[-1]
 
     # Find joint index in the object articulation by exact path match
     obj_joint_names = obj_articulation.data.joint_names
-    assert target_joint_name in obj_joint_names, f"Target joint '{target_joint_name}' not found in object joints."
+    assert (
+        target_joint_name in obj_joint_names
+    ), f"Target joint '{target_joint_name}' not found in object joints."
     target_joint_idx = obj_joint_names.index(target_joint_name)
-    
-    # Get joint limits for the target joint
-    art_joint_limits = obj_articulation.data.joint_limits.squeeze()[target_joint_idx]
 
-    # TODO: support multiple target joints on different objects
-    def lock_joint_drive():
-        """Lock joint during recovery - high damping prevents movement"""
-        obj_articulation.write_joint_damping_to_sim(1e8, joint_ids=[target_joint_idx])
-        obj_articulation.write_joint_stiffness_to_sim(0.0, joint_ids=[target_joint_idx])
-        
-    def release_joint_drive():
-        """Release joint during execution - low damping allows movement"""
-        obj_articulation.write_joint_damping_to_sim(50.0, joint_ids=[target_joint_idx])
-        obj_articulation.write_joint_stiffness_to_sim(0.0, joint_ids=[target_joint_idx])
-
-    # Start with joint locked
-    lock_joint_drive()
+    # Simulation state tracker
+    sim_state = SimulationState(num_envs=num_envs, device=sim.device)
+    sim_state.set_joint_drive_target(obj_articulation, target_joint_idx)
+    sim_state.lock_joint_drive()
 
     # Create controller
     diff_ik_cfg = DifferentialIKControllerCfg(
@@ -352,34 +503,6 @@ def run_simulator(
     base_marker = VisualizationMarkers(
         base_marker_cfg.replace(prim_path="/Visuals/robot_base")
     )
-
-    # Contact area markers (small spheres)
-    BLUE_VISUAL_MATERIAL = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.0, 1.0))
-
-    contact_marker_cfg = VisualizationMarkersCfg(
-        prim_path="/Visuals/ContactMarkers",
-        markers={
-            "sphere": sim_utils.SphereCfg(
-                radius=0.003,
-                visual_material=BLUE_VISUAL_MATERIAL,
-            )
-        },
-    )
-    contact_markers = VisualizationMarkers(contact_marker_cfg)
-
-    # green markers for displacement
-    GREEN_VISUAL_MATERIAL = sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0))
-
-    displacement_marker_cfg = VisualizationMarkersCfg(
-        prim_path="/Visuals/DisplacementMarkers",
-        markers={
-            "sphere": sim_utils.SphereCfg(
-                radius=0.0005,
-                visual_material=GREEN_VISUAL_MATERIAL,
-            )
-        },
-    )
-    displacement_markers = VisualizationMarkers(displacement_marker_cfg)
 
     l_finger_kpt = torch.tensor(
         CONTACT_AREAS["panda"]["L"], dtype=torch.float32, device=sim.device
@@ -411,8 +534,6 @@ def run_simulator(
     print(f"[INFO]: Created {len(l_finger_markers)} markers per finger")
 
     # Load handle mesh for contact detection
-    import trimesh as tm
-
     handle_mesh = tm.load(
         os.path.join(PWD, obj_config["grasp_part_mesh"]), force="mesh"
     )
@@ -426,9 +547,6 @@ def run_simulator(
         handle_mesh.sample(4096), dtype=torch.float32, device=sim.device
     )
     print(f"[INFO]: Loaded handle mesh with {len(handle_pt)} points")
-
-    # Simulation state tracker
-    sim_state = SimulationState(num_envs=num_envs, device=sim.device)
 
     # Compute grasp poses from object configuration
     grasp_poses = []
@@ -462,8 +580,6 @@ def run_simulator(
 
     # Define simulation stepping
     sim_dt = sim.get_physics_dt()
-    count = 0
-    phase = 0  # (0=waypoint, 1=grasp, 2=hold)
 
     # Body indices - resolve once
     grasp_link = obj_config["grasp_link"]
@@ -481,25 +597,44 @@ def run_simulator(
     handle_body_idx = obj_entity_cfg.body_ids[0]
 
     print("[INFO]: Starting IK control loop...")
-
-    # Define PD gains
-    # high for reaching and recovery
-    STIFF_KP = 400.0 
-    STIFF_KD = 80.0
+    count = 0
+    phase = 0
     
-    # low for more compliant manipulation in proc
-    SOFT_KP = 80.0
-    SOFT_KD = 4.0
-
     marker_data = []
+    results = {}
+    # Load existing results if present
+    results_path = f"{PWD}/results.json"
+    if os.path.exists(results_path):
+        with open(results_path, "r") as f:
+            try:
+                all_results = json.load(f)
+            except Exception:
+                all_results = {}
+    else:
+        all_results = {}
 
     while simulation_app.is_running():
         # Phase 0: 150 (waypoint) + Phase 1: 150 (grasp) + Phase 2: 50 (close gripper) and until end execution/recovery
-        if count % NUM_STEPS == 0 or sim_state.state == STATE_SUCC:
-            phase = 0
-            sim_state.locked_marker_idx = None
-            sim_state.state = STATE_INIT
-            lock_joint_drive()
+        if count % NUM_STEPS == 0 or sim_state.is_success():
+            # Save final data from previous trial
+            fname = f"{PWD}/marker_data_trial_{sim_state.trial_number}.pt"
+            torch.save(marker_data, fname)
+            print(f"[INFO]: Saved {len(marker_data)} frames to {fname}")
+            # Save results for this trial
+            trial_num = str(sim_state.trial_number)
+            all_results[trial_num] = results
+            with open(results_path, "w") as f:
+                json.dump(all_results, f, indent=2)
+
+            count = 0
+            phase = 0   
+            marker_data = []
+            results = {}
+            
+            sim_state.new_attempt()
+            results["trial_number"] = sim_state.trial_number
+            results["grasp_offset"] = args_cli.grasp_offset
+            results["exec_direction"] = args_cli.exec_dir
             print(f"\n[INFO]: Resetting to initial state...")
 
             # Reset objects
@@ -507,13 +642,16 @@ def run_simulator(
                 obj = scene[f"object_{i}"]
                 obj.write_root_pose_to_sim(obj.data.default_root_state[:, :7])
                 obj.write_joint_state_to_sim(
-                    obj.data.default_joint_pos, 
-                    obj.data.default_joint_vel
+                    obj.data.default_joint_pos, obj.data.default_joint_vel
                 )
 
             # Reset robot
-            robot.write_joint_stiffness_to_sim(STIFF_KP, joint_ids=robot_entity_cfg.joint_ids)
-            robot.write_joint_damping_to_sim(STIFF_KD, joint_ids=robot_entity_cfg.joint_ids)
+            robot.write_joint_stiffness_to_sim(
+                STIFF_KP, joint_ids=robot_entity_cfg.joint_ids
+            )
+            robot.write_joint_damping_to_sim(
+                STIFF_KD, joint_ids=robot_entity_cfg.joint_ids
+            )
             joint_pos = robot.data.default_joint_pos.clone()
             joint_vel = robot.data.default_joint_vel.clone()
             robot.write_joint_state_to_sim(joint_pos, joint_vel)
@@ -537,7 +675,6 @@ def run_simulator(
             diff_ik_controller.set_command(
                 torch.cat([target_pos_b, target_quat_b], dim=-1)
             )
-            count = 0
 
         # Phase transitions within cycle
         if count == 150 and phase == 0:
@@ -578,22 +715,21 @@ def run_simulator(
                 scene.update(sim_dt)
                 count += 1
 
-            # Initialize manipulation state
-            sim_state.state = STATE_PROC
-            robot.write_joint_stiffness_to_sim(SOFT_KP, joint_ids=robot_entity_cfg.joint_ids)
-            robot.write_joint_damping_to_sim(SOFT_KD, joint_ids=robot_entity_cfg.joint_ids)
-            print(f"[CONTROL]: Lowered PD gains for compliance.")
-            sim_state.grasp_q = robot.data.joint_pos[:, 7:9].clone()
-
             hand_pose_w = robot.data.body_pose_w[:, hand_body_idx]
             hand_transf = pose_to_transform(
                 hand_pose_w[0, :3], hand_pose_w[0, 3:7], sim.device
             )
-            sim_state.curr_proceed_base_transf = hand_transf.clone()
-            sim_state.curr_proceed_dir = get_proceeding_dir(hand_pose_w)
 
-            release_joint_drive()
-            print(f"[PHASE 2]: Starting manipulation (STATE_PROC)...")
+            _, transition_msg = sim_state.update_state(
+                hand_transf,
+                None,
+                robot,
+                robot_entity_cfg.joint_ids,
+                get_proceeding_dir(hand_pose_w),
+            )
+            if transition_msg != "":
+                print(transition_msg)
+            manip_start_step = count
 
         # Compute IK if in waypoint or grasp phase
         if phase < 2:
@@ -637,35 +773,13 @@ def run_simulator(
                 handle_pose_w[0, :3], handle_pose_w[0, 3:7], sim.device
             )
 
-            # TODO: check joint limits to stop manipulation
-            if art_joint_limits is not None:
-                joint_min = art_joint_limits[0].item()
-                joint_max = art_joint_limits[1].item()
-                joint_pos = obj_articulation.data.joint_pos.squeeze()[target_joint_idx].item()
-                joint_type = obj_config["joint_type"]
-                if joint_type == "hinge":  # revolute
-                    moved = abs(joint_pos - joint_min)
-                    moved_deg = moved * 180.0 / np.pi
-                    if moved_deg >= ROT_SUCCESS_THRES:
-                        sim_state.state = STATE_SUCC
-                        print(f"[INFO] {target_joint_name} rotated {moved_deg:.2f} deg (>{ROT_SUCCESS_THRES}), SUCCESS.")
-                        lock_joint_drive()
-                        continue
-                elif joint_type == "slider":  # prismatic
-                    moved = abs(joint_pos - joint_min)
-                    if moved >= PRISMATIC_SUCCESS_THRES:
-                        sim_state.state = STATE_SUCC
-                        print(f"[INFO] {target_joint_name} extended {moved:.2f} m (>{PRISMATIC_SUCCESS_THRES}), SUCCESS.")
-                        lock_joint_drive()
-                        continue
-                # shouldn't hit max, but include for safety
-                margin = 0.01 * abs(joint_max - joint_min)
-                if joint_pos >= joint_max - margin:
-                    sim_state.state = STATE_SUCC
-                    print(f"[INFO] {target_joint_name} reached limit ({joint_pos:.4f}), stopping manipulation.")
-                    lock_joint_drive()
-                    continue
-            
+            joint_type = obj_config["joint_type"]
+            success = sim_state.check_success(joint_type=joint_type)
+            if success:
+                completion_time = (count - manip_start_step) * sim_dt
+                results["trial_time"] = completion_time
+                print(f"[SUCCESS] Manipulation succeeded at step {count}")
+
             # Transform finger markers to world frame
             r_finger_pose_w = robot.data.body_state_w[:, r_finger_body_idx, 0:7]
             r_markers_world = quat_apply(
@@ -698,54 +812,15 @@ def run_simulator(
             if sim_state.locked_marker_idx is not None:
                 sim_state.compute_displacement(handle_transf, hand_transf)
 
-                proc_flag = sim_state.state == STATE_PROC
-                recv_flag = sim_state.state == STATE_RECV
-
-                next_recv = proc_flag and (sim_state.marker_dspl_dist > delta_0)
-                next_proc = recv_flag and (sim_state.marker_dspl_dist < delta_0 * alpha)
-
-                if next_proc:
-                    sim_state.state = STATE_PROC
-                    sim_state.attempt_counter += 1
-                    sim_state.recv_stuck_count = 0
-                    sim_state.curr_proceed_base_transf = hand_transf.clone()
-                    sim_state.curr_proceed_dir = get_proceeding_dir(hand_pose_w)
-                    release_joint_drive()
-                    robot.write_joint_stiffness_to_sim(SOFT_KP, joint_ids=robot_entity_cfg.joint_ids)
-                    robot.write_joint_damping_to_sim(SOFT_KD, joint_ids=robot_entity_cfg.joint_ids)
-                    print(
-                        f"[Step {count}] RECV -> PROC (dspl={sim_state.marker_dspl_dist:.6f})"
-                    )
-
-                if next_recv:
-                    sim_state.state = STATE_RECV
-                    lock_joint_drive()
-                    robot.write_joint_stiffness_to_sim(STIFF_KP, joint_ids=robot_entity_cfg.joint_ids)
-                    robot.write_joint_damping_to_sim(STIFF_KD, joint_ids=robot_entity_cfg.joint_ids)
-                    print(
-                        f"[Step {count}] PROC -> RECV (dspl={sim_state.marker_dspl_dist:.6f})"
-                    )
-
-                # Compute target based on state
-                if sim_state.state == STATE_PROC:
-                    sim_state.curr_proceed_base_transf[:3, 3] += (
-                        sim_state.curr_proceed_dir[0] * 0.0001
-                    )
-                    target_transf = sim_state.curr_proceed_base_transf.clone()
-
-                elif sim_state.state == STATE_RECV:
-                    sim_state.recv_stuck_count += 1
-
-                    recv_accept = torch.det(sim_state.marker_dspl_r) > 0.9999
-                    if recv_accept:
-                        target_transf = torch.matmul(sim_state.marker_dspl_transf, hand_transf).float()
-
-                    # Stuck recovery
-                    if sim_state.recv_stuck_count % 250 == 249:
-                        target_transf += torch.normal(
-                            0, 0.01, size=target_transf.shape, device=sim.device
-                        )
-                        print(f"[Step {count}] Stuck, applying noise")
+                target_transf, transition_msg = sim_state.update_state(
+                    hand_transf,
+                    handle_transf,
+                    robot,
+                    robot_entity_cfg.joint_ids,
+                    get_proceeding_dir(hand_pose_w),
+                )
+                if transition_msg != "":
+                    print(transition_msg)
 
                 curr_marker_pos_homo = torch.cat(
                     [
@@ -759,24 +834,20 @@ def run_simulator(
                 curr_marker_pos_hand = torch.matmul(
                     torch.inverse(hand_transf), curr_marker_pos_homo.T
                 ).T
-                marker_data.append(
-                    {
-                        "step": count,
-                        "state": "RECV" if sim_state.state == STATE_RECV else "PROC",
-                        "init_pos": sim_state.init_marker_pos.cpu(),
-                        "curr_pos": curr_marker_pos_hand.cpu(),
-                        "unlocked_pos": sim_state.unlocked_marker_pos.cpu(), 
-                        "displacement": sim_state.marker_dspl_dist,
-                    }
-                )
 
-                # Visualize displacement
-                if sim_state.curr_marker_pos_world is not None:
-                    displacement_markers.visualize(
-                        sim_state.curr_marker_pos_world,
-                        torch.tensor([[1, 0, 0, 0]], device=sim.device).repeat(
-                            len(sim_state.curr_marker_pos_world), 1
-                        ),
+                # TODO: only collect frame when transitioning from RECV to PROC or vice versa
+                if transition_msg == "INIT -> PROC" or transition_msg == "PROC -> RECV":
+                    marker_data.append(
+                        {
+                            "t": count * sim_dt,
+                            "state": (
+                                "RECV" if sim_state.state == STATE_RECV else "PROC"
+                            ),
+                            "init_pos": sim_state.init_marker_pos.cpu(),
+                            "curr_pos": curr_marker_pos_hand.cpu(),
+                            "unlocked_pos": sim_state.unlocked_marker_pos.cpu(),
+                            "displacement": sim_state.marker_dspl_dist,
+                        }
                     )
 
             # Apply IK for manipulation target
@@ -814,7 +885,9 @@ def run_simulator(
             )
             if sim_state.state == STATE_RECV:
                 # Maintain the width recorded at grasp onset to allow pivoting
-                robot.set_joint_position_target(sim_state.grasp_q, joint_ids=slice(7, 9))
+                robot.set_joint_position_target(
+                    sim_state.grasp_q, joint_ids=slice(7, 9)
+                )
             else:
                 robot.set_joint_position_target(gripper_closed, joint_ids=slice(7, 9))
 
@@ -853,27 +926,6 @@ def run_simulator(
         # waypoint_marker.visualize(waypoint_poses_w[:, 0:3], waypoint_poses_w[:, 3:7])
         # goal_marker.visualize(grasp_poses_w[:, 0:3], grasp_poses_w[:, 3:7])
         # base_marker.visualize(root_pose_w[:, 0:3], root_pose_w[:, 3:7])
-
-        # Contact markers visualization
-        if phase >= 2:
-            r_finger_pose_w = robot.data.body_state_w[:, r_finger_body_idx, 0:7]
-            r_markers_world = quat_apply(
-                r_finger_pose_w[:, 3:7].repeat(len(r_finger_markers), 1),
-                r_finger_markers.repeat(num_envs, 1),
-            ) + r_finger_pose_w[:, :3].repeat(len(r_finger_markers), 1)
-            contact_markers.visualize(
-                r_markers_world,
-                torch.tensor([[1, 0, 0, 0]], device=sim.device).repeat(
-                    len(r_markers_world), 1
-                ),
-            )
-
-        # Save data periodically
-        if count % 449 == 0 and len(marker_data) > 0:
-            torch.save(marker_data, f"{PWD}/marker_displacement_data.pt")
-            print(
-                f"[INFO]: Saved {len(marker_data)} frames to marker_displacement_data.pt"
-            )
 
 
 def main():
