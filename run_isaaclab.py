@@ -85,10 +85,10 @@ TRANSITION_MAP = {
     2: "PROC -> RECV",
 }
 
-delta_0 = 0.002  # 0.0004
+delta_0 = 0.0004  # 0.0004
 alpha = 0.6
 
-NUM_STEPS = 8000  # episode length
+NUM_STEPS = 20000  # episode length
 ROT_SUCCESS_THRES = 60.0  # degrees
 PRISMATIC_SUCCESS_THRES = 0.25  # meters
 
@@ -502,13 +502,6 @@ def run_simulator(
         frame_marker_cfg.replace(prim_path="/Visuals/waypoint")
     )
 
-    # Robot base frame marker
-    base_marker_cfg = FRAME_MARKER_CFG.copy()
-    base_marker_cfg.markers["frame"].scale = (0.15, 0.15, 0.15)
-    base_marker = VisualizationMarkers(
-        base_marker_cfg.replace(prim_path="/Visuals/robot_base")
-    )
-
     l_finger_kpt = torch.tensor(
         CONTACT_AREAS["panda"]["L"], dtype=torch.float32, device=sim.device
     )
@@ -607,6 +600,9 @@ def run_simulator(
 
     marker_data = []
     results = {}
+    stuck_sequences = []
+    stuck_start_step = None
+    last_state = None
     # Load existing results if present
     results_path = f"{PWD}/results.json"
     if os.path.exists(results_path):
@@ -625,25 +621,36 @@ def run_simulator(
     while simulation_app.is_running():
         # Phase 0: 150 (waypoint) + Phase 1: 150 (grasp) + Phase 2: 50 (close gripper) and until end execution/recovery
         if count % NUM_STEPS == 0 or sim_state.is_success():
+            trial_num = sim_state.trial_number
+            marker_dir = f"{PWD}/marker_data"
+            os.makedirs(marker_dir, exist_ok=True)
+            while (
+                obj_idx in all_results and str(trial_num) in all_results[obj_idx]
+            ) or os.path.exists(f"{marker_dir}/{obj_idx}_trial_{trial_num}.pt"):
+                trial_num += 1
+
             if len(marker_data) > 0:
-                # Save final data from previous trial
-                fname = f"{PWD}/marker_data/{obj_idx}_trial_{sim_state.trial_number}.pt"
+                fname = f"{marker_dir}/{obj_idx}_trial_{trial_num}.pt"
                 torch.save(marker_data, fname)
                 print(f"[INFO]: Saved {len(marker_data)} frames to {fname}")
             if results != {}:
-                trial_num = str(sim_state.trial_number)
-                # Save under all_results[obj_idx][trial_num]
                 if obj_idx not in all_results:
                     all_results[obj_idx] = {}
-                all_results[obj_idx][trial_num] = results
+                results["stuck_sequences"] = stuck_sequences
+                all_results[obj_idx][str(trial_num)] = results
                 with open(results_path, "w") as f:
                     json.dump(all_results, f, indent=2)
-                print(f"[INFO]: Saved results for object {obj_idx} trial {trial_num} to {results_path}")
+                print(
+                    f"[INFO]: Saved results for object {obj_idx} trial {trial_num} to {results_path}"
+                )
 
             count = 0
             phase = 0
             marker_data = []
             results = {}
+            stuck_sequences = []
+            stuck_start_step = None
+            last_state = None
 
             sim_state.new_attempt()
             results["grasp_offset"] = args_cli.grasp_offset
@@ -688,6 +695,26 @@ def run_simulator(
             diff_ik_controller.set_command(
                 torch.cat([target_pos_b, target_quat_b], dim=-1)
             )
+
+        # Track stuck sequences
+        current_state = sim_state.state
+        if last_state is not None:
+            if last_state != STATE_RECV and current_state == STATE_RECV:
+                stuck_start_step = count
+            elif (
+                last_state == STATE_RECV
+                and current_state != STATE_RECV
+                and stuck_start_step is not None
+            ):
+                stuck_sequences.append(
+                    {
+                        "start_step": stuck_start_step,
+                        "end_step": count - 1,
+                        "duration_steps": count - stuck_start_step,
+                    }
+                )
+                stuck_start_step = None
+        last_state = current_state
 
         # Phase transitions within cycle
         if count == 150 and phase == 0:
@@ -829,7 +856,6 @@ def run_simulator(
                         }
                     )
 
-
             # Compute target transformation
             target_transf = hand_transf.clone()
 
@@ -949,7 +975,6 @@ def run_simulator(
         # ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
         # waypoint_marker.visualize(waypoint_poses_w[:, 0:3], waypoint_poses_w[:, 3:7])
         # goal_marker.visualize(grasp_poses_w[:, 0:3], grasp_poses_w[:, 3:7])
-        # base_marker.visualize(root_pose_w[:, 0:3], root_pose_w[:, 3:7])
 
 
 def main():
