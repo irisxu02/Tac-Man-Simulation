@@ -625,12 +625,15 @@ def run_simulator(
     while simulation_app.is_running():
         # Phase 0: 150 (waypoint) + Phase 1: 150 (grasp) + Phase 2: 50 (close gripper) and until end execution/recovery
         if count % NUM_STEPS == 0 or sim_state.is_success():
-            trial_num = sim_state.trial_number
             marker_dir = f"{PWD}/marker_data"
             os.makedirs(marker_dir, exist_ok=True)
-            while (
-                obj_idx in all_results and str(trial_num) in all_results[obj_idx]
-            ) or os.path.exists(f"{marker_dir}/{obj_idx}_trial_{trial_num}.pt"):
+            trial_num = sim_state.trial_number
+            while True:
+                trial_num_str = str(trial_num)
+                marker_path = f"{marker_dir}/{obj_idx}_trial_{trial_num}.pt"
+                trial_taken = (obj_idx in all_results and trial_num_str in all_results[obj_idx]) or os.path.exists(marker_path)
+                if not trial_taken:
+                    break
                 trial_num += 1
 
             if len(marker_data) > 0:
@@ -641,12 +644,12 @@ def run_simulator(
                 if obj_idx not in all_results:
                     all_results[obj_idx] = {}
                 results["stuck_sequences"] = stuck_sequences
+                if count % NUM_STEPS == 0 and not sim_state.is_success():
+                    results["status"] = "max_steps_reached"
                 all_results[obj_idx][str(trial_num)] = results
                 with open(results_path, "w") as f:
                     json.dump(all_results, f, indent=2)
-                print(
-                    f"[INFO]: Saved results for object {obj_idx} trial {trial_num} to {results_path}"
-                )
+                print(f"[INFO]: Saved results for object {obj_idx} trial {trial_num} to {results_path}")
 
             count = 0
             phase = 0
@@ -657,6 +660,7 @@ def run_simulator(
             last_state = None
 
             sim_state.new_attempt()
+            results["max_displacement"] = delta_0
             results["grasp_offset"] = args_cli.grasp_offset
             results["exec_direction"] = args_cli.exec_dir
             print(f"\n[INFO]: Resetting to initial state...")
@@ -821,7 +825,8 @@ def run_simulator(
             success = sim_state.check_success(joint_type=joint_type)
             if success:
                 completion_time = (count - manip_start_step) * sim_dt
-                results["trial_time"] = completion_time
+                results["status"] = "success"
+                results["trial_time"] = np.round(completion_time, 2)
                 print(f"[SUCCESS] Manipulation succeeded at step {count}")
 
             # Transform finger markers to world frame
@@ -975,7 +980,6 @@ def run_simulator(
 
         # Visualize
         # ee_pose_w = robot.data.body_state_w[:, ee_body_idx, 0:7]
-        # root_pose_w = robot.data.root_pose_w
         # ee_marker.visualize(ee_pose_w[:, 0:3], ee_pose_w[:, 3:7])
         # waypoint_marker.visualize(waypoint_poses_w[:, 0:3], waypoint_poses_w[:, 3:7])
         # goal_marker.visualize(grasp_poses_w[:, 0:3], grasp_poses_w[:, 3:7])
