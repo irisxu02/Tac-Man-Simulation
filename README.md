@@ -1,4 +1,14 @@
-For IsaacSim 5.0, the entry point is my_application.py
+Reimplementation for IsaacSim 5.0 with IsaacLab 2.2.0
+
+Convert URDF files to USD using the script at [data_urdf_to_usd.sh](data_urdf_to_usd.sh) OR download processed data directly. Note that for the gapartnet data, dashes were replaced with underscores in the names of mesh files, material files, and link names to adhere to naming conventions and resolve issues with the file converter.
+
+- Download USD gapartnet from [Google Drive](https://drive.google.com/file/d/1WuOZ7GVs8NkeHRPfqAxmvvF_YMcqtY3j/view?usp=sharing)
+- Download USD playboards from [Google Drive](https://drive.google.com/file/d/1gFHG68Csp3fe8jz2ih66aHZPEgqEpedz/view?usp=sharing)
+
+Execute ```run_partnet_isaaclab.py```. Additional optional arguments `--exec_dir` and `--grasp_offset`. Removed `capture` argument.
+
+Not yet implemented playboard simulation.
+
 
 ---
 # Tac-Man: Simulation Studies
